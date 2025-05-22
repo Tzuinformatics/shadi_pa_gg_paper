@@ -1,0 +1,2246 @@
+---
+title: "06_additions"
+author: "Tian Liu"
+date: "2024_11_01"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "html") })
+output:
+  html_document:
+    theme: yeti
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    highlight: kate
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, message = FALSE, warning = FALSE)
+```
+
+
+```{r, message = FALSE}
+source(here::here(file.path("./utils.R")))
+seed_value <- 20210805
+set.seed(seed_value)
+
+library(CellChat) # devtools::install_github("jinworks/CellChat")
+library(patchwork)
+library(openxlsx)
+library(circlize)
+library(dplyr)
+library(scran)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(ReactomePA)
+library(writexl)
+library(ggplot2)
+library(escape)
+library(SingleCellExperiment)
+library(Seurat)
+library(SeuratObject)
+library(RColorBrewer)
+library(viridis)
+library(enrichR)
+
+```
+
+# Load data
+
+Need to extract out cell type annotations for tumor and myeloid, move to main object. Will
+split data into individual samples then run cellchat individually. L<->R interactions
+will be identified that are reproducibly in multiple samples.
+
+
+```{r}
+so <- qread(file.path("objects/preprocessing/so_filtered_final_v2.qs"))
+
+so_myl <- qread(file.path("immune", "objects", "so_myeloid.qs"))
+so_t <- qread(file.path("immune", "objects", "so_lym.qs"))
+so_gg <- qread(file.path("tumor", "objects", "so_tumor_gg2.qs"))
+so_pa <- qread(file.path("tumor", "objects", "so_tumor_pa2.qs"))
+
+myl_annots <- data.frame(
+  cell = names(so_myl$simple_myl_cell_type),
+  subpopulation = so_myl$simple_myl_cell_type,
+  major_population = "myeloid")
+
+t_annots <- data.frame(
+  cell = names(so_t$simple_t_cell_type),
+  subpopulation = so_t$simple_t_cell_type,
+  major_population = "t")
+
+pa_annots <- data.frame(
+  cell = names(so_pa$pa_subpopulation),
+  subpopulation = so_pa$pa_subpopulation,
+  major_population = "pa")
+
+gg_annots <- data.frame(
+  cell = names(so_gg$gg_subpopulation),
+  subpopulation = so_gg$gg_subpopulation,
+  major_population = "gg")
+
+remap_pa <- c(
+  "NPC-like (VIM+ HOPX+ GFAP+)" = "AC-like-2",
+  "Intermediate (ASCL1+ JUNB+ SOX3+)" = "OPC-like",
+  "Differentiatied (MOG+ PLP1+)" = "OC-like-1",
+  "TNC+ FOXD3+" = "OC-like-2",
+  "MAPKhi" = "MAPKhi",
+  "PCDHG+" = "AC-like-1",
+  "1171-specific" = "1171-specific",
+  "Hypoxic (VEGFA+ ADM+ ENO1+)" = "Hypoxic",
+  "1459-specific (SIX1/6+)" = "1459-specific"
+)
+
+remap_gg <- c(
+  "Astrocyte? AQP1/4+ CLU+"  = "AC-like-1",
+  "PDGFRA+ Cell-cycle arrest (CDKN1/2+)" = "Glycolysis_hi",
+  "Olig (mature)" = "OC-like",
+  "PDGFRA+" = "OPC-like",
+  "PDGFRA+ PCDHGA+" = "AC-like-2",
+  "Neuron? (RBFOX3+ ZIC1+ BOC+ STMN2+)" = "Ribosome_hi",
+  "Neuron? (STMN1+ GABRG2+ CHGA/B+ EOMES+)" = "Neuron-like"
+)
+
+pa_annots$subpopulation <- remap_pa[pa_annots$subpopulation]
+gg_annots$subpopulation <- remap_gg[gg_annots$subpopulation]
+
+subpopulation_annots <- rbind(pa_annots, gg_annots, myl_annots, t_annots)
+
+so <- so[, colnames(so) %in% subpopulation_annots$cell]
+idx <- match(colnames(so), subpopulation_annots$cell)
+
+so@meta.data <- cbind(so@meta.data,
+                      subpopulation_annots[idx, c("subpopulation", "major_population")])
+```
+
+```{r}
+pa <- so[, so$Dx == "pilocytic astrocytoma"]
+gg <- so[, so$Dx == "ganglioglioma"]
+```
+
+# 1. CellChat
+
+```{r}
+dir.create("objects/cellchat", recursive = TRUE)
+
+objs <- c("objects/cellchat/cell-chat-pas.rds", 
+          "objects/cellchat/cell-chat-ggs.rds")
+
+if(!all(file.exists(objs))) {
+  ## Change: Analyze all the pathways in CellChat without filtering for specific types:
+  CellChatDB <- CellChatDB.human
+  
+  run_cellchat <- function(x, grp = "subpopulation") {
+    cellchat <- createCellChat(object = x,
+                               group.by = grp,
+                               assay = "RNA")
+    cellchat@DB <- CellChatDB
+    
+    cellchat <- subsetData(cellchat) |>
+      identifyOverExpressedGenes() |>
+      identifyOverExpressedInteractions() |>
+      computeCommunProb(type = "triMean") |>
+      filterCommunication(min.cells = 10) |>
+      computeCommunProbPathway() |>
+      aggregateNet() |>
+      netAnalysis_computeCentrality(slot.name = "netP")  
+
+    df.net <- subsetCommunication(cellchat)
+    list(ccobj = cellchat, 
+         df = df.net)
+  }
+  
+  pa_ccs <- lapply(SplitObject(pa, "UPN"), run_cellchat)
+  saveRDS(pa_ccs, "objects/cellchat/cell-chat-pas.rds")
+  
+  gg_ccs <- lapply(SplitObject(gg, "UPN"), run_cellchat)
+  saveRDS(gg_ccs, "objects/cellchat/cell-chat-ggs.rds")
+} else {
+  pa_ccs <- readRDS(objs[1])
+  gg_ccs <- readRDS(objs[2])
+}
+
+tumor_subpops <- c(pa_annots$subpopulation, gg_annots$subpopulation)  |>
+  as.character()
+myeloid_pops <- as.character(myl_annots$subpopulation)
+
+pa_res <- lapply(pa_ccs, "[[", "df") |> rbindlist(idcol = "UPN")
+gg_res <- lapply(gg_ccs, "[[", "df") |> rbindlist(idcol = "UPN")
+```
+
+## 1.1 Subset to myeloid <-> tumor interactions
+
+```{r}
+idx <- (pa_res$source %in% tumor_subpops & pa_res$target %in% myeloid_pops) | 
+  (pa_res$source %in% myeloid_pops & pa_res$target %in% tumor_subpops) 
+  
+pa_myl_t <- pa_res[idx, ]
+setDT(pa_myl_t)
+pa_myl_t[, n_tumors := .N, by = .(source, target, interaction_name)]
+pa_myl_t <- pa_myl_t[n_tumors >= 2]
+pa_myl_t[, 
+         mean_communication_prob := mean(prob),
+         by = .(source, target, interaction_name)]
+
+to_keep <- setdiff(colnames(pa_myl_t), c("UPN", "pval", "prob"))
+pa_myl_t <- pa_myl_t[, ..to_keep] |> unique()
+
+pa_myl_t <- pa_myl_t[order(source, target, -mean_communication_prob), ]
+pa_myl_t
+```
+
+```{r}
+idx <- (gg_res$source %in% tumor_subpops & gg_res$target %in% myeloid_pops) | 
+  (gg_res$source %in% myeloid_pops & gg_res$target %in% tumor_subpops) 
+  
+gg_myl_t <- gg_res[idx, ]
+setDT(gg_myl_t)
+gg_myl_t[, n_tumors := .N, by = .(source, target, interaction_name)]
+gg_myl_t <- gg_myl_t[n_tumors >= 2]
+gg_myl_t[, 
+         mean_communication_prob := mean(prob),
+         by = .(source, target, interaction_name)]
+
+to_keep <- setdiff(colnames(gg_myl_t), c("UPN", "pval", "prob"))
+gg_myl_t <- gg_myl_t[, ..to_keep] |> unique()
+gg_myl_t <- gg_myl_t[order(source, target, -mean_communication_prob), ]
+gg_myl_t
+```
+
+## 1.2 Change Some Names
+
+```{r}
+# Add: Change some info as Shadi asked
+pa_myl_t_updated <- pa_myl_t
+pa_myl_t_updated
+```
+
+```{r}
+# Apply the necessary substitutions to the 'source' column
+pa_myl_t_updated$source <- gsub("P2R712\\+", "P2RY12\\+", pa_myl_t_updated$source)
+pa_myl_t_updated$source <- gsub("Myeloid \\(CCL3\\+\\)", "Myeloid-Chemokine", pa_myl_t_updated$source)
+pa_myl_t_updated$source <- gsub("Chemokine \\(CCL3\\+\\)", "Myeloid-undefined", pa_myl_t_updated$source)
+
+# Apply the necessary substitutions to the 'target' column
+pa_myl_t_updated$target <- gsub("P2R712\\+", "P2RY12\\+", pa_myl_t_updated$target)
+pa_myl_t_updated$target <- gsub("Myeloid \\(CCL3\\+\\)", "Myeloid-Chemokine", pa_myl_t_updated$target)
+pa_myl_t_updated$target <- gsub("Chemokine \\(CCL3\\+\\)", "Myeloid-undefined", pa_myl_t_updated$target)
+
+pa_myl_t_updated
+```
+
+```{r}
+# Add: Change some info as Shadi asked
+gg_myl_t_updated <- gg_myl_t
+gg_myl_t_updated
+```
+
+```{r}
+# Apply the necessary substitutions to the 'source' column
+gg_myl_t_updated$source <- gsub("P2R712\\+", "P2RY12\\+", gg_myl_t_updated$source)
+gg_myl_t_updated$source <- gsub("Myeloid \\(CCL3\\+\\)", "Myeloid-Chemokine", gg_myl_t_updated$source)
+gg_myl_t_updated$source <- gsub("Chemokine \\(CCL3\\+\\)", "Myeloid-undefined", gg_myl_t_updated$source)
+
+# Apply the necessary substitutions to the 'target' column
+gg_myl_t_updated$target <- gsub("P2R712\\+", "P2RY12\\+", gg_myl_t_updated$target)
+gg_myl_t_updated$target <- gsub("Myeloid \\(CCL3\\+\\)", "Myeloid-Chemokine", gg_myl_t_updated$target)
+gg_myl_t_updated$target <- gsub("Chemokine \\(CCL3\\+\\)", "Myeloid-undefined", gg_myl_t_updated$target)
+
+
+gg_myl_t_updated
+```
+
+# SAVE POINT
+
+```{r}
+res_06_additions = paste0("./res_06_additions")
+
+if(!exists(res_06_additions)){
+  dir.create(res_06_additions, recursive = TRUE)
+}
+```
+
+```{r}
+preamble <- openxlsx::read.xlsx(file.path("tables/readme_myeloid_tumor_interactions.xlsx"), colNames = FALSE)
+
+colnames(preamble) <- c("column", "info")
+openxlsx::write.xlsx(list("README" = preamble, "PA" = pa_myl_t_updated, "GG" = gg_myl_t_updated), 
+                    file.path(res_06_additions, "/myeloid_tumor_interactions_updated_labels_without_subset_final.xlsx"),
+                    overwrite = TRUE)
+```
+
+```{r}
+CellChatDB <- CellChatDB.human
+
+interaction_table <- CellChatDB$interaction
+interaction_table
+
+write.csv(interaction_table, file.path(res_06_additions, "/interaction_table.csv"), row.names = FALSE)
+```
+
+# 2. Chord Plot
+
+```{r}
+Chord_plot = paste0(res_06_additions, "/Chord_plot")
+
+if(!exists(Chord_plot)){
+  dir.create(Chord_plot, recursive = TRUE)
+}
+```
+
+```{r}
+# Load the data with the cell type information added by Shadi to separate tumor and immune
+
+file_path <- file.path("tables/myeloid_tumor_interactions_updated_labels_without_subset_final_cell_type_added.xlsx")
+
+pa_celltype_data <- read.xlsx(file_path, sheet = "PA", colNames = TRUE)
+gg_celltype_data <- read.xlsx(file_path, sheet = "GG", colNames = TRUE)
+```
+
+## 2.1 PA
+
+```{r}
+# Source and Target of PA, separating tumor and immune, adding ligand and receptor as rectangles and also show in legend
+
+set.seed(99)
+
+# Define the list of pathways
+pathways <- c("MIF", "CCL", "PTN")
+
+# Loop through each pathway and create a chord plot
+for (pathway in pathways) {
+  
+  # Subset the data for the current pathway
+  pa_pathway_data <- subset(pa_celltype_data, pathway_name == pathway)
+  
+  # Create a matrix for the chord plot
+  interaction_matrix <- as.matrix(xtabs(mean_communication_prob ~ source + target, data = pa_pathway_data))
+  
+  # Prepare the grouping information
+  source_groups <- pa_pathway_data %>%
+    distinct(source, cell_type_source) %>%
+    deframe() # Convert to named vector
+  
+  target_groups <- pa_pathway_data %>%
+    distinct(target, cell_type_target) %>%
+    deframe()
+  
+  # Merge both vectors into a single named vector
+  all_groups <- c(source_groups, target_groups)
+
+  # Define unique ligands and receptors
+  unique_ligands <- unique(pa_pathway_data$ligand)
+  unique_receptors <- unique(pa_pathway_data$receptor)
+
+  # Generate distinct colors for ligands
+  ligand_colors <- setNames(rainbow(length(unique_ligands), start = 0.2, end = 0.5), unique_ligands)
+  # Generate distinct colors for receptors
+  receptor_colors <- setNames(rainbow(length(unique_receptors), start = 0.6, end = 0.9), unique_receptors)
+
+  # Clear previous settings to reset the plotting environment
+  circos.clear()
+
+  # Set up the parameters to shrink the canvas
+  circos.par(canvas.xlim = c(-1.7, 1.7), canvas.ylim = c(-1.7, 1.7))
+
+  # Open a PDF file to save the plot for the current pathway
+  pdf(paste0(Chord_plot, "/PA_chord_plot_", pathway, "_pathway_combined.pdf"), width = 10, height = 10)
+  
+  # Draw the chord plot
+  chordDiagram(interaction_matrix, 
+               transparency = 0.5, 
+               directional = TRUE, # Or directional = 1
+               # the arrows point from the source cell type to the target cell type, indicating the direction of signaling.
+               annotationTrack = c("grid"), 
+               preAllocateTracks = list(track.height = 0.1),
+               direction.type = c("diffHeight", "arrows"),
+               link.arr.type = "big.arrow",
+               group = all_groups)
+  
+  # Add ligand and receptor rectangles using circos.rect
+  # Fetch sector-specific ylim
+  ylim <- get.cell.meta.data("ylim", track.index = 1)
+
+  for (i in seq_len(nrow(pa_pathway_data))) {
+    current_source <- pa_pathway_data$source[i]
+    current_target <- pa_pathway_data$target[i]
+    current_ligand <- pa_pathway_data$ligand[i]
+    current_receptor <- pa_pathway_data$receptor[i]
+  
+    # Y ranges for ligands and receptors
+    ligand_y1 <- ylim[1] + (ylim[2] - ylim[1]) * 0.2
+    receptor_y1 <- ylim[1] + (ylim[2] - ylim[1]) * 0.5
+     
+    # Ligand rectangle
+    circos.rect(
+      xleft = get.cell.meta.data("xlim", sector.index = current_source)[1],
+      xright = get.cell.meta.data("xlim", sector.index = current_source)[2],
+      ybottom = ligand_y1,
+      ytop = ligand_y1 + 0.2,
+      col = ligand_colors[current_ligand],
+      border = ligand_colors[current_ligand],
+      sector.index = current_source,
+      track.index = 1
+    )
+  
+    # Receptor rectangle
+    circos.rect(
+      xleft = get.cell.meta.data("xlim", sector.index = current_target)[1],
+      xright = get.cell.meta.data("xlim", sector.index = current_target)[2],
+      ybottom = receptor_y1,
+      ytop = receptor_y1 + 0.2,
+      col = receptor_colors[current_receptor],
+      border = receptor_colors[current_receptor],
+      sector.index = current_target,
+      track.index = 1
+    )
+  }
+  
+  par(mar = c(1, 1, 1, 1))
+  
+  # Combine ligand and receptor legends
+  legend(
+    "topright", 
+    inset = c(0, 0.1), 
+    legend = c("Ligands", names(ligand_colors), "", "Receptors", names(receptor_colors)), 
+    col = c(NA, ligand_colors, NA, NA, receptor_colors),  # NA for titles and spacing
+    pch = c(NA, rep(15, length(ligand_colors)), NA, NA, rep(15, length(receptor_colors))),  # NA for titles and spacing
+    cex = 0.8,
+    bty = "n",
+    title = NULL,
+    xpd = TRUE
+  )
+
+  # Customize text to show source and target names as vertical labels, with more distance from the circle
+  circos.track(track.index = 1, panel.fun = function(x, y) {
+      # Adjust the y position to move the text further from the circle (by adding some factor)
+      circos.text(CELL_META$xcenter, CELL_META$ylim[2] + 0.05, CELL_META$sector.index,
+          facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5))
+  }, bg.border = NA)
+  
+  title(paste("PA Chord Plot of", pathway, "Pathway - Source and Target (with ligand and receptor showed in legend)"))
+  
+  dev.off()
+}
+```
+
+## 2.2 GG
+
+```{r}
+# Source and Target of PA, separating tumor and immune, adding ligand and receptor rectangles
+
+set.seed(99)
+
+# Define the list of pathways
+pathways <- c("MIF", "PTN")
+
+# Loop through each pathway and create a chord plot
+for (pathway in pathways) {
+  
+  # Subset the data for the current pathway
+  gg_pathway_data <- subset(gg_celltype_data, pathway_name == pathway)
+  
+  # Create a matrix for the chord plot
+  interaction_matrix <- as.matrix(xtabs(mean_communication_prob ~ source + target, data = gg_pathway_data))
+  
+  # Prepare the grouping information
+  source_groups <- gg_pathway_data %>%
+    distinct(source, cell_type_source) %>%
+    deframe() # Convert to named vector
+  
+  target_groups <- gg_pathway_data %>%
+    distinct(target, cell_type_target) %>%
+    deframe()
+  
+  # Merge both vectors into a single named vector
+  all_groups <- c(source_groups, target_groups)
+
+  # Define unique ligands and receptors
+  unique_ligands <- unique(gg_pathway_data$ligand)
+  unique_receptors <- unique(gg_pathway_data$receptor)
+
+  # Generate distinct colors for ligands
+  ligand_colors <- setNames(rainbow(length(unique_ligands), start = 0.2, end = 0.5), unique_ligands)
+  # Generate distinct colors for receptors
+  receptor_colors <- setNames(rainbow(length(unique_receptors), start = 0.6, end = 0.9), unique_receptors)
+
+  # Clear previous settings to reset the plotting environment
+  circos.clear()
+
+  # Set up the parameters to shrink the canvas
+  circos.par(canvas.xlim = c(-1.7, 1.7), canvas.ylim = c(-1.7, 1.7))
+
+  # Open a PDF file to save the plot for the current pathway
+  pdf(paste0(Chord_plot, "/GG_chord_plot_", pathway, "_pathway_combined.pdf"), width = 10, height = 10)
+  
+  # Draw the chord plot
+  chordDiagram(interaction_matrix, 
+               transparency = 0.5, 
+               directional = TRUE, # Or directional = 1
+               # the arrows point from the source cell type to the target cell type, indicating the direction of signaling.
+               annotationTrack = c("grid"), 
+               preAllocateTracks = list(track.height = 0.1),
+               direction.type = c("diffHeight", "arrows"),
+               link.arr.type = "big.arrow",
+               group = all_groups)
+  
+  # Add ligand and receptor rectangles using circos.rect
+  # Fetch sector-specific ylim
+  ylim <- get.cell.meta.data("ylim", track.index = 1)
+
+  for (i in seq_len(nrow(gg_pathway_data))) {
+    current_source <- gg_pathway_data$source[i]
+    current_target <- gg_pathway_data$target[i]
+    current_ligand <- gg_pathway_data$ligand[i]
+    current_receptor <- gg_pathway_data$receptor[i]
+  
+    # Y ranges for ligands and receptors
+    ligand_y1 <- ylim[1] + (ylim[2] - ylim[1]) * 0.2
+    receptor_y1 <- ylim[1] + (ylim[2] - ylim[1]) * 0.5
+     
+    # Ligand rectangle
+    circos.rect(
+      xleft = get.cell.meta.data("xlim", sector.index = current_source)[1],
+      xright = get.cell.meta.data("xlim", sector.index = current_source)[2],
+      ybottom = ligand_y1,
+      ytop = ligand_y1 + 0.2,
+      col = ligand_colors[current_ligand],
+      border = ligand_colors[current_ligand],
+      sector.index = current_source,
+      track.index = 1
+    )
+  
+    # Receptor rectangle
+    circos.rect(
+      xleft = get.cell.meta.data("xlim", sector.index = current_target)[1],
+      xright = get.cell.meta.data("xlim", sector.index = current_target)[2],
+      ybottom = receptor_y1,
+      ytop = receptor_y1 + 0.2,
+      col = receptor_colors[current_receptor],
+      border = receptor_colors[current_receptor],
+      sector.index = current_target,
+      track.index = 1
+    )
+  }
+  
+  par(mar = c(1, 1, 1, 1))
+  
+  # Combine ligand and receptor legends
+  legend(
+    "topright", 
+    inset = c(0, 0.1), 
+    legend = c("Ligands", names(ligand_colors), "", "Receptors", names(receptor_colors)), 
+    col = c(NA, ligand_colors, NA, NA, receptor_colors),  # NA for titles and spacing
+    pch = c(NA, rep(15, length(ligand_colors)), NA, NA, rep(15, length(receptor_colors))), 
+    cex = 0.8,
+    bty = "n",
+    title = NULL,
+    xpd = TRUE
+  )
+
+  # Customize text to show source and target names as vertical labels, with more distance from the circle
+  circos.track(track.index = 1, panel.fun = function(x, y) {
+      # Adjust the y position to move the text further from the circle (by adding some factor)
+      circos.text(CELL_META$xcenter, CELL_META$ylim[2] + 0.05, CELL_META$sector.index,
+          facing = "clockwise", niceFacing = TRUE, adj = c(0, 0.5))
+  }, bg.border = NA)
+  
+  title(paste("GG Chord Plot of", pathway, "Pathway - Source and Target (with ligand and receptor showed in legend)"))
+  
+  dev.off()
+}
+```
+
+# 3. Bubble Plot
+
+```{r}
+Bubble_plot = paste0(res_06_additions, "/Bubble_plot")
+
+if(!exists(Bubble_plot)){
+  dir.create(Bubble_plot, recursive = TRUE)
+}
+```
+
+## 3.1 PA Tumor
+
+```{r}
+# Reference: from "tumor/pa.Rmd"
+# Here use SingleCellExperiment Object
+
+so_pa <- qread(file.path("tumor", "objects", "so_tumor_pa2.qs"))
+
+so_pa$Dx_simple <- ifelse(str_detect(so_pa$Dx, "low grade glioma"),
+                       "low grade glioma",
+                       so_pa$Dx)
+```
+
+```{r}
+so_pa@meta.data
+```
+
+```{r}
+plot_harmony(so_pa, "pa_tumor_harmony_res.0.3", legend_title = "harmony-clusters") 
+```
+
+```{r}
+# Change the new labels
+# cluster 0 = OC-like 1
+# cluster 1 = OPC-like
+# cluster 2 = AC-like 1
+# cluster 3 = 1459-specific
+# cluster 4 = MAPKhi
+# cluster 5 = AC-like 2
+# cluster 6 = Hypoxic
+# cluster 7 = 1171-specific
+# cluster 8 = OC-like 2
+
+# Add the 'cell_type' column to the metadata
+so_pa@meta.data <- so_pa@meta.data %>%
+  mutate(cell_type = case_when(
+    pa_tumor_harmony_res.0.3 == 0 ~ "OC-like 1",
+    pa_tumor_harmony_res.0.3 == 1 ~ "OPC-like",
+    pa_tumor_harmony_res.0.3 == 2 ~ "AC-like 1",
+    pa_tumor_harmony_res.0.3 == 3 ~ "1459-specific",
+    pa_tumor_harmony_res.0.3 == 4 ~ "MAPKhi",
+    pa_tumor_harmony_res.0.3 == 5 ~ "AC-like 2",
+    pa_tumor_harmony_res.0.3 == 6 ~ "Hypoxic",
+    pa_tumor_harmony_res.0.3 == 7 ~ "1171-specific",
+    pa_tumor_harmony_res.0.3 == 8 ~ "OC-like 2",
+    TRUE ~ NA_character_  # Default case if no match is found
+  ))
+
+so_pa@meta.data
+```
+
+```{r}
+plot_harmony(so_pa, "cell_type", legend_title = "Cell Type") 
+```
+
+### findMarkers
+
+```{r}
+so_pa_set <- so_pa
+so_diet_pa <- DietSeurat(so_pa, graphs = "pca")
+sce_pa <- as.SingleCellExperiment(so_diet_pa)
+rm(so_diet_pa)
+
+sce_pa$pa_tumor_harmony_res.0.3 <- droplevels(sce_pa$pa_tumor_harmony_res.0.3)
+markers.cell_type.up <- findMarkers(sce_pa,
+                                groups = sce_pa$cell_type,
+                                block = sce_pa$orig.ident, # control for batch effects or sample differences.
+                                lfc = 0.5,
+                                direction="up")
+```
+
+```{r}
+gene_list <- c(
+  "PLP1", "BCAS1", "GPR17", "TUBB4A", "FYN", "SIRT2", "DYNLL1", "TNR", "MARCKSL1", "CNP", "OLIG1", "MGLL", 
+  "OLIG2", "RAMP1", "APOD", "BCAN", "EPN2", "PDGFRA", "CST3", "S100B", "FTH1", "MT3", "EEF1A1", "RPL13", 
+  "RPLP1", "RPL3", "RPS18", "SCG3", "ABHD2", "VCAN", "ALCAM", "MALAT1", "NEAT1", "WSB1", "SNHG14", "MEG3", 
+  "FTX", "ANKRD36C", "LUC7L3", "AL360020.1", "GOLGA8A", "VIM", "AL049839.2", "GFAP", "APOE", "C1QL1", "TIMP1", 
+  "SPARCL1", "ID4", "IGFBP7", "LGALS3", "VEGFA", "GAPDH", "PGK1", "MT2A", "BNIP3", "TPI1", "ADM", "RPL41", 
+  "SLC1A2", "DNER", "TSPAN7", "ARC", "ALDOC", "CRYAB", "PMP22", "GAS7", "SERINC5", "CDH19", "AZGP1", "INHBA"
+)
+
+cluster_order <- c("OC-like 1", "OPC-like", "AC-like 1", "1459-specific", "MAPKhi", 
+                   "AC-like 2", "Hypoxic", "1171-specific", "OC-like 2")
+```
+
+```{r}
+processed_clusters <- lapply(names(markers.cell_type.up), function(cluster_name) {
+  cluster_markers <- markers.cell_type.up[[cluster_name]]
+  
+  # Create a data frame for the current cluster
+  data.frame(
+    Gene = rownames(cluster_markers),
+    Cluster = cluster_name,
+    summary.logFC = cluster_markers$summary.logFC,
+    p.value = cluster_markers$p.value
+  )
+})
+
+bubble_plot_data <- bind_rows(processed_clusters) %>%
+  filter(Gene %in% gene_list)
+```
+
+```{r}
+bubble_plot_data <- bubble_plot_data %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_list), 
+    Cluster = factor(Cluster, levels = cluster_order)
+  )
+
+
+logFC_midpoint <- mean(bubble_plot_data$summary.logFC)  # Use the mean of logFC as midpoint
+
+bubble_plot <- ggplot(bubble_plot_data, aes(x = Cluster, y = Gene)) +
+  geom_point(aes(size = -log10(p.value), color = summary.logFC)) +
+  scale_y_discrete(limits = rev(levels(bubble_plot_data$Gene))) +  # Reverse the y-axis
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = logFC_midpoint) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "PA Tumor - Marker Genes Across Clusters",
+    x = "Cluster",
+    y = "Gene",
+    size = "-log10(p-value)",
+    color = "LogFC"
+  )
+
+ggsave(filename = paste0(Bubble_plot, "/PA_Tumor_findMarkers.pdf"), plot = bubble_plot, width = 10, height = 20)
+```
+
+## 3.2 GG Tumor
+
+```{r}
+so_gg <- qread(file.path("..", "tumor", "objects", "so_tumor_gg2.qs"))
+
+so_gg$Dx_simple <- ifelse(str_detect(so_gg$Dx, "low grade glioma"),
+                       "low grade glioma",
+                       so_gg$Dx)
+```
+
+```{r}
+so_gg@meta.data
+```
+
+```{r}
+plot_harmony(so_gg, "gg_tumor_harmony_res.0.7", legend_title = "harmony-clusters") 
+```
+
+```{r}
+# Change the new labels
+# cluster 0 = OPC-like
+# cluster 6 = OPC-like
+# cluster 2 = Glycolysis_hi
+# cluster 4 = Glycolysis_hi
+# cluster 10 = Glycolysis_hi
+# cluster 5 = AC-like 1
+# cluster 8 = AC-like 1
+# cluster 1 = Ribosome_hi
+# cluster 9 = Neuron-like
+# cluster 7 = AC-like 2
+# cluster 12 = OC-like
+
+# Add the 'cell_type' column to the metadata
+so_gg@meta.data <- so_gg@meta.data %>%
+  mutate(cell_type = case_when(
+    gg_tumor_harmony_res.0.7 %in% c(0, 6) ~ "OPC-like",
+    gg_tumor_harmony_res.0.7 %in% c(2, 4, 10) ~ "Glycolysis_hi",
+    gg_tumor_harmony_res.0.7 %in% c(5, 8) ~ "AC-like 1",
+    gg_tumor_harmony_res.0.7 == 1 ~ "Ribosome_hi",
+    gg_tumor_harmony_res.0.7 == 9 ~ "Neuron-like",
+    gg_tumor_harmony_res.0.7 == 7 ~ "AC-like 2",
+    gg_tumor_harmony_res.0.7 == 12 ~ "OC-like",
+    TRUE ~ NA_character_
+  ))
+
+so_gg@meta.data
+```
+
+```{r}
+plot_harmony(so_gg, "cell_type", legend_title = "harmony-clusters") 
+```
+
+### findMarkers
+
+```{r}
+so_gg_set <- so_gg
+so_diet_gg <- DietSeurat(so_gg, graphs = "pca")
+sce_gg <- as.SingleCellExperiment(so_diet_gg)
+rm(so_diet_gg)
+
+sce_gg$gg_tumor_harmony_res.0.7 <- droplevels(sce_gg$gg_tumor_harmony_res.0.7)
+markers.cell_type.up <- findMarkers(sce_gg,
+                                groups = sce_gg$cell_type,
+                                block = sce_gg$orig.ident,
+                                lfc = 0.5,
+                                direction="up")
+```
+
+```{r}
+gene_list <- c(
+  "TNR", "PTPRZ1", "APOD", "BCAN", "PDGFRA", "EPN2", "FABP7", "VCAN", "FOS", "ABHD2", "RPS23", "RPL18A", "RPS3A", "RPS27A", "RPL5", "RPS6", "RPS14", 
+  "RPLP1", "RPS18", "RPLP0", "MALAT1", "VIM", "CDKN2A", "TIMP1", "SERPINE2", "AKAP12", "PTN", "LGALS3", "SOX2", "CLU", "CST3", "SPARCL1", "IGFBP2", "HOPX", 
+  "CKB", "COX6A1", "ATP1A2", "UQCR10", "PCDHGC4", "PCDHGB2", "PCDHGB5", "PCDHGB1", "OLIG1", "PCDHGA5", "PCDHGA9", "PMP2", "PCDH9", "PRDX1", "H3-3B", 
+  "PLP1", "MBP", "ERMN", "CNP", "APLP1", "TUBB4A", "TF", "CLDND1", "QKI", "SEPTIN7"
+)
+
+cluster_order <- c("OPC-like", "Ribosome_hi", "Glycolysis_hi", "AC-like 1", "AC-like 2", "Neuron-like", "OC-like")
+```
+
+```{r}
+processed_clusters <- lapply(names(markers.cell_type.up), function(cluster_name) {
+  cluster_markers <- markers.cell_type.up[[cluster_name]]
+  
+  # Create a data frame for the current cluster
+  data.frame(
+    Gene = rownames(cluster_markers),
+    Cluster = cluster_name,
+    summary.logFC = cluster_markers$summary.logFC,
+    p.value = cluster_markers$p.value
+  )
+})
+
+bubble_plot_data <- bind_rows(processed_clusters) %>%
+  filter(Gene %in% gene_list)
+```
+
+```{r}
+bubble_plot_data <- bubble_plot_data %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_list), 
+    Cluster = factor(Cluster, levels = cluster_order)
+  )
+
+
+logFC_midpoint <- mean(bubble_plot_data$summary.logFC)  # Use the mean of logFC as midpoint
+
+bubble_plot <- ggplot(bubble_plot_data, aes(x = Cluster, y = Gene)) +
+  geom_point(aes(size = -log10(p.value), color = summary.logFC)) +
+  scale_y_discrete(limits = rev(levels(bubble_plot_data$Gene))) +  # Reverse the y-axis
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = logFC_midpoint) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "GG Tumor - Marker Genes Across Clusters",
+    x = "Cluster",
+    y = "Gene",
+    size = "-log10(p-value)",
+    color = "LogFC"
+  )
+
+ggsave(filename = paste0(Bubble_plot, "/GG_Tumor_findMarkers.pdf"), plot = bubble_plot, width = 10, height = 20)
+```
+
+## 3.3 Immune - Myeloid
+
+```{r}
+so_myeloid <- qread(file.path("..", "immune", "objects", "so_myeloid.qs"), nthreads = 4)
+
+so_myeloid@meta.data
+plot_harmony(so_myeloid, "UPN")
+plot_harmony(so_myeloid, "myl_harmony_res.0.3", legend_title = "harmony-clusters") 
+```
+
+```{r}
+# Subset from the Paper Table 1 (separate PA and GG)
+
+pa_myeloid_UPNs <- c("855", "897", "946", "957", "1033", "1056", "1057", "1171", "1266", "1272", "1330", "1453", "1459")
+
+so_pa_myeloid <- so_myeloid[, so_myeloid$UPN %in% pa_myeloid_UPNs]
+
+so_pa_myeloid@meta.data
+plot_harmony(so_pa_myeloid, "UPN")
+plot_harmony(so_pa_myeloid, "myl_harmony_res.0.3", legend_title = "clusters") 
+```
+
+```{r}
+# Change the new labels
+# cluster 0 = Microglia(Comp+P2RY12+)
+# cluster 1 = Myeloid-Chemokine
+# cluster 5 = Myeloid-Chemokine
+# cluster 2 = Microglia(P2RY12+)
+# cluster 3 = Microglia(CCL3+P2RY12+)
+# cluster 4 = DC-like myeloid
+# cluster 10 = DC-like myeloid
+# cluster 6 = NT
+# cluster 7 = Myeloid-Undefined
+# cluster 8 = M2(MRC1+)
+# cluster 9 = Myeloid-Tumor(MAP1B+)
+# cluster 11 = Hypoxia
+
+so_pa_myeloid@meta.data <- so_pa_myeloid@meta.data %>%
+  mutate(cell_type = case_when(
+    myl_harmony_res.0.3 == 0 ~ "Microglia(Comp+P2RY12+)",
+    myl_harmony_res.0.3 %in% c(1, 5) ~ "Myeloid-Chemokine",
+    myl_harmony_res.0.3 == 2 ~ "Microglia(P2RY12+)",
+    myl_harmony_res.0.3 == 3 ~ "Microglia(CCL3+P2RY12+)",
+    myl_harmony_res.0.3 %in% c(4, 10) ~ "DC-like myeloid",
+    myl_harmony_res.0.3 == 6 ~ "NT",
+    myl_harmony_res.0.3 == 7 ~ "Myeloid-Undefined",
+    myl_harmony_res.0.3 == 8 ~ "M2(MRC1+)",
+    myl_harmony_res.0.3 == 9 ~ "Myeloid-Tumor(MAP1B+)",
+    myl_harmony_res.0.3 == 11 ~ "Hypoxia",
+    TRUE ~ NA_character_  # Default case if no match is found
+  ))
+
+so_pa_myeloid@meta.data
+plot_harmony(so_pa_myeloid, "cell_type", legend_title = "clusters") 
+```
+
+```{r}
+gg_myeloid_UPNs <- c("1116", "1181", "1216", "1417", "1455", "1491", "1492")
+
+so_gg_myeloid <- so_myeloid[, so_myeloid$UPN %in% gg_myeloid_UPNs]
+
+so_gg_myeloid@meta.data
+plot_harmony(so_gg_myeloid, "UPN")
+plot_harmony(so_gg_myeloid, "myl_harmony_res.0.3", legend_title = "clusters") 
+```
+
+```{r}
+# Change the new labels
+# cluster 0 = Microglia(Comp+P2RY12+)
+# cluster 1 = Myeloid-Chemokine
+# cluster 5 = Myeloid-Chemokine
+# cluster 2 = Microglia(P2RY12+)
+# cluster 3 = Microglia(CCL3+P2RY12+)
+# cluster 4 = DC-like myeloid
+# cluster 10 = DC-like myeloid
+# cluster 6 = NT
+# cluster 7 = Myeloid-Undefined
+# cluster 8 = M2(MRC1+)
+# cluster 9 = Myeloid-Tumor(MAP1B+)
+# cluster 11 = Hypoxia
+
+so_gg_myeloid@meta.data <- so_gg_myeloid@meta.data %>%
+  mutate(cell_type = case_when(
+    myl_harmony_res.0.3 == 0 ~ "Microglia(Comp+P2RY12+)",
+    myl_harmony_res.0.3 %in% c(1, 5) ~ "Myeloid-Chemokine",
+    myl_harmony_res.0.3 == 2 ~ "Microglia(P2RY12+)",
+    myl_harmony_res.0.3 == 3 ~ "Microglia(CCL3+P2RY12+)",
+    myl_harmony_res.0.3 %in% c(4, 10) ~ "DC-like myeloid",
+    myl_harmony_res.0.3 == 6 ~ "NT",
+    myl_harmony_res.0.3 == 7 ~ "Myeloid-Undefined",
+    myl_harmony_res.0.3 == 8 ~ "M2(MRC1+)",
+    myl_harmony_res.0.3 == 9 ~ "Myeloid-Tumor(MAP1B+)",
+    myl_harmony_res.0.3 == 11 ~ "Hypoxia",
+    TRUE ~ NA_character_  # Default case if no match is found
+  ))
+
+so_gg_myeloid@meta.data
+plot_harmony(so_gg_myeloid, "cell_type", legend_title = "harmony-clusters") 
+```
+
+```{r}
+so_combined_myeloid <- merge(so_pa_myeloid, y = so_gg_myeloid, project = "Combined_Myeloid")
+
+so_combined_myeloid@meta.data <- so_combined_myeloid@meta.data[, colSums(is.na(so_combined_myeloid@meta.data)) < nrow(so_combined_myeloid@meta.data)]
+so_combined_myeloid@meta.data
+```
+
+
+### findMarkers
+
+```{r}
+so_diet_myeloid <- DietSeurat(so_combined_myeloid, graphs = "pca")
+sce_myeloid <- as.SingleCellExperiment(so_diet_myeloid)
+rm(so_diet_myeloid)
+
+markers.cell_type.up <- findMarkers(sce_myeloid,
+                                groups = sce_myeloid$cell_type,
+                                block = sce_myeloid$orig.ident,
+                                lfc = 0.5,
+                                direction="up")
+```
+
+```{r}
+gene_list <- c(
+  "APOE", "C1QB", "C1QA", "APOC1", "C3", "CCL3", "CCL4", "RGS1", "SGK1", "HLA-DPA1", "MALAT1", "JUN", "NEAT1", "BTG2", "A2M", "TUBB2B", 
+  "RPL17-C18orf32", "MAP1B", "RPS18", "RPS5", "SPP1", "CCL4L2", "CX3CR1", "C1QC", "P2RY12", "CD9", "TREM2", "GPNMB", "CD63", 
+  "CTSD", "SELENOP", "MRC1", "RNASE1", "LYVE1", "FOLR2", "HLA-DPB1", "AREG", "FCER1A", "HLA-DQB1", "HLA-DRA", "S100A9", "LYZ", "S100A8", 
+  "FCN1", "S100A4", "PLIN2", "MIF", "LDHA", "VIM", "GAPDH"
+)
+
+cluster_order <- c("Microglia(Comp+P2RY12+)", "Myeloid-Chemokine", "Microglia(P2RY12+)", "Myeloid-Tumor(MAP1B+)", "Microglia(CCL3+P2RY12+)", 
+                  "Myeloid-Undefined", "M2(MRC1+)", "DC-like myeloid", "NT", "Hypoxia")
+```
+
+```{r}
+processed_clusters <- lapply(names(markers.cell_type.up), function(cluster_name) {
+  cluster_markers <- markers.cell_type.up[[cluster_name]]
+  
+  # Create a data frame for the current cluster
+  data.frame(
+    Gene = rownames(cluster_markers),
+    Cluster = cluster_name,
+    summary.logFC = cluster_markers$summary.logFC,
+    p.value = cluster_markers$p.value
+  )
+})
+
+bubble_plot_data <- bind_rows(processed_clusters) %>%
+  filter(Gene %in% gene_list)
+```
+
+```{r}
+bubble_plot_data <- bubble_plot_data %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_list), 
+    Cluster = factor(Cluster, levels = cluster_order)
+  )
+
+logFC_midpoint <- mean(bubble_plot_data$summary.logFC)  # Use the mean of logFC as midpoint
+
+bubble_plot <- ggplot(bubble_plot_data, aes(x = Cluster, y = Gene)) +
+  geom_point(aes(size = -log10(p.value), color = summary.logFC)) +
+  scale_y_discrete(limits = rev(levels(bubble_plot_data$Gene))) +  # Reverse the y-axis
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = logFC_midpoint) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "Immune Myeloid - Marker Genes Across Clusters",
+    x = "Cluster",
+    y = "Gene",
+    size = "-log10(p-value)",
+    color = "LogFC"
+  )
+
+ggsave(filename = paste0(Bubble_plot, "/Immune_Myeloid_findMarkers.pdf"), plot = bubble_plot, width = 10, height = 20)
+```
+
+## 3.4 Immune - T-cell
+
+```{r}
+so_lym <- qread(file.path("..", "immune", "objects", "so_lym.qs"), nthreads = 4)
+
+so_lym@meta.data
+plot_harmony(so_lym, "UPN")
+plot_harmony(so_lym, "t_harmony_res.0.3", legend_title = "harmony-clusters") 
+```
+
+```{r}
+# Subset from the Paper Table 1 (separate PA and GG)
+
+pa_lym_UPNs <- c("855", "897", "946", "957", "1033", "1056", "1057", "1171", "1266", "1272", "1330", "1453", "1459")
+
+so_pa_lym <- so_lym[, so_lym$UPN %in% pa_lym_UPNs]
+
+so_pa_lym@meta.data
+plot_harmony(so_pa_lym, "UPN")
+plot_harmony(so_pa_lym, "t_harmony_res.0.3", legend_title = "clusters") 
+```
+
+```{r}
+# Change the new labels
+# cluster 0 = CD8_TH1
+# cluster 1 = CD4
+# cluster 5 = CD4
+# cluster 2 = CD8_dying
+# cluster 3 = gdT
+# cluster 4 = CD8
+# cluster 6 = NK
+# cluster 7 = Treg
+# cluster 8 = NKT
+
+so_pa_lym@meta.data <- so_pa_lym@meta.data %>%
+  mutate(cell_type = case_when(
+    t_harmony_res.0.3 == 0 ~ "CD8_TH1",
+    t_harmony_res.0.3 %in% c(1, 5) ~ "CD4",
+    t_harmony_res.0.3 == 2 ~ "CD8_dying",
+    t_harmony_res.0.3 == 3 ~ "gdT",
+    t_harmony_res.0.3 == 4 ~ "CD8",
+    t_harmony_res.0.3 == 6 ~ "NK",
+    t_harmony_res.0.3 == 7 ~ "Treg",
+    t_harmony_res.0.3 == 8 ~ "NKT",
+    TRUE ~ NA_character_  # Default case if no match is found
+  ))
+
+so_pa_lym@meta.data
+plot_harmony(so_pa_lym, "cell_type", legend_title = "clusters") 
+```
+
+```{r}
+# Specify the UPN values to include in the plot
+gg_lym_UPNs <- c("1116", "1181", "1216", "1417", "1455", "1491", "1492")
+
+# Subset the Seurat object based on the 'UPN' metadata column
+so_gg_lym <- so_lym[, so_lym$UPN %in% gg_lym_UPNs]
+
+# Plot the Harmony UMAP with only the specified UPN values
+plot_harmony(so_gg_lym, "UPN")
+plot_harmony(so_gg_lym, "t_harmony_res.0.3", legend_title = "clusters") 
+```
+
+```{r}
+# Change the new labels
+# cluster 0 = CD8_TH1
+# cluster 1 = CD4
+# cluster 5 = CD4
+# cluster 2 = CD8_dying
+# cluster 3 = gdT
+# cluster 4 = CD8
+# cluster 6 = NK
+# cluster 7 = Treg
+# cluster 8 = NKT
+
+so_gg_lym@meta.data <- so_gg_lym@meta.data %>%
+  mutate(cell_type = case_when(
+    t_harmony_res.0.3 == 0 ~ "CD8_TH1",
+    t_harmony_res.0.3 %in% c(1, 5) ~ "CD4",
+    t_harmony_res.0.3 == 2 ~ "CD8_dying",
+    t_harmony_res.0.3 == 3 ~ "gdT",
+    t_harmony_res.0.3 == 4 ~ "CD8",
+    t_harmony_res.0.3 == 6 ~ "NK",
+    t_harmony_res.0.3 == 7 ~ "Treg",
+    t_harmony_res.0.3 == 8 ~ "NKT",
+    TRUE ~ NA_character_  # Default case if no match is found
+  ))
+
+so_gg_lym@meta.data
+plot_harmony(so_gg_lym, "cell_type", legend_title = "clusters") 
+```
+
+```{r}
+so_combined_lym <- merge(so_pa_lym, y = so_gg_lym, project = "Combined_Lym")
+
+so_combined_lym@meta.data <- so_combined_lym@meta.data[, colSums(is.na(so_combined_lym@meta.data)) < nrow(so_combined_lym@meta.data)]
+so_combined_lym@meta.data
+```
+
+### findMarkers
+
+```{r}
+so_diet_lym <- DietSeurat(so_combined_lym, graphs = "pca")
+sce_lym <- as.SingleCellExperiment(so_diet_lym)
+rm(so_diet_lym)
+
+markers.cell_type.up <- findMarkers(sce_lym,
+                                groups = sce_lym$cell_type,
+                                block = sce_lym$orig.ident,
+                                lfc = 0.5,
+                                direction="up")
+```
+
+```{r}
+gene_list <- c(
+  "IL7R", "KLRB1", "TPT1", "LTB", "RPLP0", "GZMK", "CCL5", "GZMA", "GZMH", "TMSB4X", "MALAT1", "MT-ND1", "MT-CO3", "MT-CO2", "MT-CO1", 
+  "CCL4", "CD8A", "CD8B", "NKG7", "CD3D", "KLRD1", "TRDC", "CTSW", "XCL2", "XCL1", "GNLY", "GZMB", "FGFBP2", "PRF1", "FCGR3A", "TRIR", 
+  "IL32", "TNFRSF18", "TIGIT", "CTLA4", "S100A4"
+)
+cluster_order <- c("CD4", "CD8", "CD8_dying", "CD8_TH1", "gdT", "NK", "NKT", "Treg")
+```
+
+```{r}
+processed_clusters <- lapply(names(markers.cell_type.up), function(cluster_name) {
+  cluster_markers <- markers.cell_type.up[[cluster_name]]
+  
+  # Create a data frame for the current cluster
+  data.frame(
+    Gene = rownames(cluster_markers),
+    Cluster = cluster_name,
+    summary.logFC = cluster_markers$summary.logFC,
+    p.value = cluster_markers$p.value
+  )
+})
+
+bubble_plot_data <- bind_rows(processed_clusters) %>%
+  filter(Gene %in% gene_list)
+```
+
+```{r}
+bubble_plot_data <- bubble_plot_data %>%
+  mutate(
+    Gene = factor(Gene, levels = gene_list), 
+    Cluster = factor(Cluster, levels = cluster_order)
+  )
+
+logFC_midpoint <- mean(bubble_plot_data$summary.logFC)  # Use the mean of logFC as midpoint
+
+bubble_plot <- ggplot(bubble_plot_data, aes(x = Cluster, y = Gene)) +
+  geom_point(aes(size = -log10(p.value), color = summary.logFC)) +
+  scale_y_discrete(limits = rev(levels(bubble_plot_data$Gene))) +  # Reverse the y-axis
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = logFC_midpoint) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 8),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "Immune T-Cell - Marker Genes Across Clusters",
+    x = "Cluster",
+    y = "Gene",
+    size = "-log10(p-value)",
+    color = "LogFC"
+  )
+
+ggsave(filename = paste0(Bubble_plot, "/Immune_T-Cell_findMarkers.pdf"), plot = bubble_plot, width = 10, height = 20)
+```
+
+# 4. ssGSEA
+
+```{r}
+ssGSEA_res = paste0(res_06_additions, "/ssGSEA_res")
+
+if(!exists(ssGSEA_res)){
+  dir.create(ssGSEA_res, recursive = TRUE)
+}
+```
+
+## 4.1 PA - Tumor 
+
+### 4.1.1 OPC-like
+
+```{r}
+# GO:0042063
+# ASCL1,VCAN,PTPRZ1,PLPP3,GPR37L1,OLIG2,CSPG5,SOX8,BCAN,DNER,OLIG1,APCDD1,OMG,TNR,S100B,TSC22D1,ABHD2
+# GO:0031102
+# APOD,OMG,TNR,CSPG5,GPM6A,PTPRZ1,S100B,OLIG2,OLIG1,PDGFRA,SLC1A2,PLPP3,ABHD2,CD81
+
+ssgsea_gene_sets <- list(
+  GO_0042063 = c("ASCL1", "VCAN", "PTPRZ1", "PLPP3", "GPR37L1", "OLIG2", "CSPG5", "SOX8", "BCAN", "DNER", "OLIG1", "APCDD1", "OMG", "TNR", "S100B", "TSC22D1", "ABHD2"),
+  GO_0031102 = c("APOD", "OMG", "TNR", "CSPG5", "GPM6A", "PTPRZ1", "S100B", "OLIG2", "OLIG1", "PDGFRA", "SLC1A2", "PLPP3", "ABHD2", "CD81")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0042063 = "Gliogenesis",
+  GO_0031102 = "Neuron Projection Regeneration"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor OPC-like:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_OPC-like_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.2 OC-like 1
+
+```{r}
+# GO:0031175
+# ACTB,APLP1,CNP,FYN,MAP1A,PLP1,TNR,UGT8,TUBA1A,WASF1,SEMA5A,OLIG2,CYFIP2,TNFRSF21,ATCAY,OLIG1,S100A1,DYNLL1,SIRT2,BCAN
+# GO:0010001
+# CNP,GPR17,PLP1,TUBA1A,ZEB2,OLIG2,SIRT2,SOX8,BCAN,OLIG1,MOG,SEMA5A
+# GO:0021762
+# ACTB,CNP,PLP1,S100A1,DYNLL1,SIRT2
+# GO:0042552
+# PLP1,UGT8,BCAS1,OLIG2,SIRT2,TNFRSF21,SOX8
+
+
+ssgsea_gene_sets <- list(
+  GO_0031175 = c("ACTB", "APLP1", "CNP", "FYN", "MAP1A", "PLP1", "TNR", "UGT8", "TUBA1A", "WASF1", "SEMA5A", "OLIG2", "CYFIP2", "TNFRSF21", "ATCAY", "OLIG1", "S100A1", "DYNLL1", "SIRT2", "BCAN"),
+  GO_0010001 = c("CNP", "GPR17", "PLP1", "TUBA1A", "ZEB2", "OLIG2", "SIRT2", "SOX8", "BCAN", "OLIG1", "MOG", "SEMA5A"),
+  GO_0021762 = c("ACTB", "CNP", "PLP1", "S100A1", "DYNLL1", "SIRT2"),
+  GO_0042552 = c("PLP1", "UGT8", "BCAS1", "OLIG2", "SIRT2", "TNFRSF21", "SOX8")
+)
+
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0031175 = "Neuron Projection Development",
+  GO_0010001 = "Glial Cell Differentiation",
+  GO_0021762 = "Substantia Nigra Development",
+  GO_0042552 = "Myelination"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor OC-like 1:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_OC-like1_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.3 OC-like 2
+
+```{r}
+# GO:0042552
+# CLU,DAG1,GPM6B,PLP1,PMP22,LGI4,SERINC5,CNP,VIM,HAPLN2
+# GO:0031175
+# CNP,DAG1,GFRA1,GPM6B,PLP1,PTN,S100B,VIM,GAS7,FEZ1,CLU,NES,CDH19
+
+ssgsea_gene_sets <- list(
+  GO_0042552 = c("CLU", "DAG1", "GPM6B", "PLP1", "PMP22", "LGI4", "SERINC5", "CNP", "VIM", "HAPLN2"),
+  GO_0031175 = c("CNP", "DAG1", "GFRA1", "GPM6B", "PLP1", "PTN", "S100B", "VIM", "GAS7", "FEZ1", "CLU", "NES", "CDH19")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0042552 = "Myelination",
+  GO_0031175 = "Neuron Projection Development"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor OC-like 2:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_OC-like2_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.4 AC-like 1
+
+```{r}
+# R-HSA-156902
+# EEF1A1,RPL3,RPL7A,RPL8,RPL11,RPL13,RPL15,RPL18,RPL18A,RPL19,RPL23A,RPL30,RPL28,RPL29,RPL32,RPL34,RPL37,RPL41,RPLP1,RPS2,RPS3,RPS3A,RPS4X,RPS8,RPS9,RPS12,RPS14,RPS18,RPS23,RPS27A,RPL13A,NACA
+
+ssgsea_gene_sets <- list(
+  R_HSA_156902 = c("EEF1A1", "RPL3", "RPL7A", "RPL8", "RPL11", "RPL13", "RPL15", "RPL18", "RPL18A", "RPL19", 
+                   "RPL23A", "RPL30", "RPL28", "RPL29", "RPL32", "RPL34", "RPL37", "RPL41", "RPLP1", "RPS2", 
+                   "RPS3", "RPS3A", "RPS4X", "RPS8", "RPS9", "RPS12", "RPS14", "RPS18", "RPS23", "RPS27A", 
+                   "RPL13A", "NACA")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  R_HSA_156902 = "Peptide Chain Elongation"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor AC-like 1:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_AC-like1_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.5 AC-like 2
+
+```{r}
+# R-HSA-109582
+# SERPINA3,ATP1B2,SERPING1,CD44,CD63,CD74,CLU,CD99,S100A10,SPARC,TIMP1,TIMP3,SCG3,TUBB2B,CST3,LGALS3,APOE,GADD45A,LGALS1,S100A6,C1QL1,CD81,GFAP
+# R-HSA-8957275
+# APOE,CST3,IGFBP7,LGALS1,TIMP1,SPARCL1,PRSS23,SCG3,S100A6
+
+ssgsea_gene_sets <- list(
+  R_HSA_109582 = c("SERPINA3", "ATP1B2", "SERPING1", "CD44", "CD63", "CD74", "CLU", "CD99", "S100A10", "SPARC", 
+                   "TIMP1", "TIMP3", "SCG3", "TUBB2B", "CST3", "LGALS3", "APOE", "GADD45A", "LGALS1", "S100A6", 
+                   "C1QL1", "CD81", "GFAP"),
+  R_HSA_8957275 = c("APOE", "CST3", "IGFBP7", "LGALS1", "TIMP1", "SPARCL1", "PRSS23", "SCG3", "S100A6")
+)
+
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  R_HSA_109582 = "Hemostasis",
+  R_HSA_8957275 = "Post-translational Protein Phosphorylation"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor AC-like 2:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_AC-like2_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.6 MAPKhi
+
+```{r}
+# GO:0002090
+# MKLN1,SYNE1,AHI1
+# GO:0008380
+# SFPQ,SNRNP70,SRSF11,DDX17,LUC7L3
+
+ssgsea_gene_sets <- list(
+  GO_0002090 = c("MKLN1", "SYNE1", "AHI1"),
+  GO_0008380 = c("SFPQ", "SNRNP70", "SRSF11", "DDX17", "LUC7L3")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 3
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0002090 = "Regulation of Receptor Internalization",
+  GO_0008380 = "RNA Splicing"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor MAPKhi:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_MAPKhi_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.7 Hypoxic
+
+```{r}
+# WP534
+# ENO1,ENO2,GAPDH,LDHA,PFKP,PGK1,TPI1,VEGFA,VGF,MIF,P4HA1,VIM
+# M255
+# ADM,BNIP3,CA9,ENO1,LDHA,PGK1,VEGFA,BNIP3L,CAV1,ERO1A,RACK1,GAPDH,TPT1
+
+ssgsea_gene_sets <- list(
+  WP534 = c("ENO1", "ENO2", "GAPDH", "LDHA", "PFKP", "PGK1", "TPI1", "VEGFA", "VGF", "MIF", "P4HA1", "VIM"),
+  M255 = c("ADM", "BNIP3", "CA9", "ENO1", "LDHA", "PGK1", "VEGFA", "BNIP3L", "CAV1", "ERO1A", "RACK1", "GAPDH", "TPT1")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_pa,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_pa <- so_pa_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_pa@meta.data <- cbind(
+  so_pa@meta.data,
+  scaled_enrichment_scores[rownames(so_pa@meta.data), , drop = FALSE]
+)
+
+so_pa@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  WP534 = "Glycolysis and Gluconeogenesis",
+  M255 = "PID HIF1 TFPATHWAY"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_pa, reduction = "harmony_umap"))
+umap_data$cell_type <- so_pa@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_pa@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("PA Tumor Hypoxic:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/PA_Tumor_Hypoxic_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+## 4.2 GG - Tumor
+
+### 4.1.1 OPC-like
+
+```{r}
+# GO:0051960
+# VCAN,MAP2,MT3,SERPINE2,PTN,PTPRZ1,TNR,SEMA5A,GPR37L1,NRXN1,QKI,SOX8,BCAN,METRN,LRP1,CSPG5,DNER,OLIG1,FOS
+# GO:0031175
+# APOD,MAP2,NRCAM,PTN,PTPRZ1,S100B,TNR,SEMA5A,NRXN1,CSPG5,CHL1,METRN,OLIG1,CDH19,ATP1B2,MT3,SPOCK1,ITM2C,OLFM1,GPR37L1,SERPINE2,CST3,SLC1A2,SOX8
+ssgsea_gene_sets <- list(
+  GO_0051960 = c("VCAN", "MAP2", "MT3", "SERPINE2", "PTN", "PTPRZ1", "TNR", "SEMA5A", "GPR37L1", "NRXN1", "QKI", "SOX8", "BCAN", "METRN", "LRP1", "CSPG5", "DNER", "OLIG1", "FOS"),
+  GO_0031175 = c("APOD", "MAP2", "NRCAM", "PTN", "PTPRZ1", "S100B", "TNR", "SEMA5A", "NRXN1", "CSPG5", "CHL1", "METRN", "OLIG1", "CDH19", "ATP1B2", "MT3", "SPOCK1", "ITM2C", "OLFM1", "GPR37L1", "SERPINE2", "CST3", "SLC1A2", "SOX8")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_gg,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_gg <- so_gg_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_gg@meta.data <- cbind(
+  so_gg@meta.data,
+  scaled_enrichment_scores[rownames(so_gg@meta.data), , drop = FALSE]
+)
+
+so_gg@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0051960 = "Regulation of Nervous System Development",
+  GO_0031175 = "Neuron Projection Development"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_gg, reduction = "harmony_umap"))
+umap_data$cell_type <- so_gg@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_gg@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("GG Tumor OPC-like:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/GG_Tumor_OPC-like_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.2 AC-like 1
+
+```{r}
+# WP111
+# ATP5ME,COX5B,COX6A1,COX6C,COX7B,NDUFA3,NDUFB4,UQCRQ,UQCR10,NDUFA12,BLOC1S1,POLR2L,SLC1A2,SLC1A3,TUBB2A,ACSL3,RHEB,PTGES3,ATP1A2,ATP1B2,MGST3,RGCC,PRDX6
+
+ssgsea_gene_sets <- list(
+  WP111 = c("ATP5ME", "COX5B", "COX6A1", "COX6C", "COX7B", "NDUFA3", "NDUFB4", "UQCRQ", "UQCR10", "NDUFA12", "BLOC1S1", "POLR2L", "SLC1A2", "SLC1A3", "TUBB2A", "ACSL3", "RHEB", "PTGES3", "ATP1A2", "ATP1B2", "MGST3", "RGCC", "PRDX6")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_gg,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_gg <- so_gg_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_gg@meta.data <- cbind(
+  so_gg@meta.data,
+  scaled_enrichment_scores[rownames(so_gg@meta.data), , drop = FALSE]
+)
+
+so_gg@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  WP111 = "Electron Transport Chain OXPHOS System in Mitochondria")
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_gg, reduction = "harmony_umap"))
+umap_data$cell_type <- so_gg@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_gg@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("GG Tumor AC-like 1:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/GG_Tumor_AC-like1_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.3 AC-like 2
+
+```{r}
+# GO:0007156
+# PCDHGC4,PCDHGB5,PCDHGB2,PCDHGB1,PCDHGA9,PCDHGA5
+# GO:0050767
+# B2M,MT3,PTN,PTPRZ1,BCAN,S100B,APOD,OLIG1,CST3
+
+ssgsea_gene_sets <- list(
+  GO_0007156 = c("PCDHGC4", "PCDHGB5", "PCDHGB2", "PCDHGB1", "PCDHGA9", "PCDHGA5"),
+  GO_0050767 = c("B2M", "MT3", "PTN", "PTPRZ1", "BCAN", "S100B", "APOD", "OLIG1", "CST3")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_gg,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_gg <- so_gg_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_gg@meta.data <- cbind(
+  so_gg@meta.data,
+  scaled_enrichment_scores[rownames(so_gg@meta.data), , drop = FALSE]
+)
+
+so_gg@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0007156 = "Homophilic Cell Adhesion via Plasma Membrane Adhesion Molecules",
+  GO_0050767 = "Regulation of Neurogenesis"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_gg, reduction = "harmony_umap"))
+umap_data$cell_type <- so_gg@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_gg@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("GG Tumor AC-like 2:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/GG_Tumor_AC-like2_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.4 Glycolysis_hi
+
+```{r}
+# GO:0043086
+# CDKN2A,LGALS3,LRP1,SERPINE2,TIMP1,IRS2,SPRY2,NES,PHPT1,NUCKS1,APOD,TSC22D1,SYT11,PJA2,VIM,HNRNPA2B1,SOX2
+
+ssgsea_gene_sets <- list(
+  GO_0043086 = c("CDKN2A", "LGALS3", "LRP1", "SERPINE2", "TIMP1", "IRS2", "SPRY2", "NES", "PHPT1", "NUCKS1", "APOD", "TSC22D1", "SYT11", "PJA2", "VIM", "HNRNPA2B1", "SOX2")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_gg,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_gg <- so_gg_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_gg@meta.data <- cbind(
+  so_gg@meta.data,
+  scaled_enrichment_scores[rownames(so_gg@meta.data), , drop = FALSE]
+)
+
+so_gg@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  GO_0043086 = "Negative Regulation of Catalytic Activity"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_gg, reduction = "harmony_umap"))
+umap_data$cell_type <- so_gg@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_gg@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("GG Tumor Glycolysis_hi:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/GG_Tumor_Glycolysis_hi_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.5 Ribosome_hi
+
+```{r}
+# WP477
+# FAU,RPL10A,RPL5,RPL9,RPL10,RPL11,RPL18A,RPL21,RPL22,RPL30,RPL28,RPL32,RPL35A,RPL37,RPL39,RPL41,RPLP0,RPLP1,RPS3,RPS3A,RPS4X,RPS4Y1,RPS5,RPS6,RPS8,RPS11,RPS12,RPS13,RPS14,RPS18,RPS19,RPS21,RPS23,RPS24,RPS25,RPS27,RPS27A,RPS28,RPS29,RACK1,NACA
+
+ssgsea_gene_sets <- list(
+  WP477 = c("FAU", "RPL10A", "RPL5", "RPL9", "RPL10", "RPL11", "RPL18A", "RPL21", "RPL22", "RPL30", "RPL28", "RPL32", "RPL35A", "RPL37", "RPL39", "RPL41", "RPLP0", "RPLP1", "RPS3", "RPS3A", "RPS4X", "RPS4Y1", "RPS5", "RPS6", "RPS8", "RPS11", "RPS12", "RPS13", "RPS14", "RPS18", "RPS19", "RPS21", "RPS23", "RPS24", "RPS25", "RPS27", "RPS27A", "RPS28", "RPS29", "RACK1", "NACA")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_gg,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_gg <- so_gg_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_gg@meta.data <- cbind(
+  so_gg@meta.data,
+  scaled_enrichment_scores[rownames(so_gg@meta.data), , drop = FALSE]
+)
+
+so_gg@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  WP477 = "Regulation of Nervous System Development"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_gg, reduction = "harmony_umap"))
+umap_data$cell_type <- so_gg@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_gg@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("GG Tumor Ribosome_hi:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/GG_Tumor_Ribosome_hi_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+### 4.1.6 OC-like
+
+```{r}
+# WP2276
+# CNP,MBP,PLP1,APLP1,APP,QKI,S100B,PRDX1
+# GO:0061564
+# APLP1,APP,CNP,PLP1,S100B,QKI
+
+ssgsea_gene_sets <- list(
+  WP2276 = c("CNP", "MBP", "PLP1", "APLP1", "APP", "QKI", "S100B", "PRDX1"),
+  GO_0061564 = c("APLP1", "APP", "CNP", "PLP1", "S100B", "QKI")
+)
+
+enrichment_scores <- escape.matrix(
+  sce_gg,
+  gene.sets = ssgsea_gene_sets,
+  groups = 1000,
+  min.size = 4
+)
+```
+
+```{r}
+so_gg <- so_gg_set
+
+# Define the scaled enrichment scores
+scaled_enrichment_scores <- scale(enrichment_scores)
+
+# Add the scaled enrichment scores to the metadata
+so_gg@meta.data <- cbind(
+  so_gg@meta.data,
+  scaled_enrichment_scores[rownames(so_gg@meta.data), , drop = FALSE]
+)
+
+so_gg@meta.data
+```
+
+```{r}
+pathways <- c(names(ssgsea_gene_sets))
+
+pathway_descriptions <- c(
+  WP2276 = "Glial Cell Differentiation",
+  GO_0061564 = "Axon Development"
+)
+
+# Extract UMAP coordinates
+umap_data <- as.data.frame(Embeddings(so_gg, reduction = "harmony_umap"))
+umap_data$cell_type <- so_gg@meta.data$cell_type
+
+# Iterate over pathways and generate plots
+for (pathway in pathways) {
+  umap_data[[pathway]] <- so_gg@meta.data[[pathway]]
+  
+  # Get pathway description
+  description <- pathway_descriptions[pathway]
+  
+  p <- ggplot(umap_data, aes(x = UMAP_1, y = UMAP_2)) +
+    geom_point(aes(color = !!sym(pathway)), alpha = 0.4, size = 1) + 
+    scale_color_viridis(option = "viridis", name = "Activity Score", direction = 1) +
+    geom_text(data = umap_data %>%
+                group_by(cell_type) %>%
+                summarize(
+                  UMAP_1 = mean(UMAP_1),
+                  UMAP_2 = mean(UMAP_2)
+                ),
+              aes(label = cell_type), size = 2, fontface = "bold") +
+    theme_minimal() +
+    labs(
+      title = paste("GG Tumor OC-like:", pathway, "-", description, "Pathway"),
+      x = "UMAP 1", y = "UMAP 2"
+    ) +
+    theme(
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.ticks = element_blank()
+    )
+  
+  # Save plot
+  ggsave(filename = paste0(ssGSEA_res, "/GG_Tumor_OC-like_ssGSEA_UMAP_", pathway, "_", description, ".pdf"), plot = p, width = 10, height = 8)
+}
+```
+
+# Session info  
+
+```{r}
+sessionInfo()
+```
