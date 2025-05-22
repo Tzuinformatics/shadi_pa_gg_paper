@@ -1,0 +1,830 @@
+---
+title: "Analysis of Ganglioglioma populations"
+author: "Kent Riemondy RBI"
+date: "`r Sys.Date()`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "html") })
+output:
+  html_document:
+    theme: yeti
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    highlight: kate
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+
+```{r, message = FALSE}
+source(here::here("src/utils.R"))
+seed_value <- 20210805
+library(ggbeeswarm)
+library(ggpubr)
+library(rstatix)
+```
+
+```{r}
+so <- qread(file.path("objects", "so_tumor_gg2.qs"), nthreads = 4)
+so_old <- qread(file.path("objects", "so_tumor_gg.qs"), nthreads = 4)
+```
+
+## Overview 
+
+### UPN
+
+The clustering is driven by each patient specific sample, so batch correction will be necessary.Of note these samples are more heterogenous than the PA samples, which overlap more strongly without batch correction. Perhaps a CNV or BRAF effect? 
+
+```{r}
+plot_umap(so, "UPN")
+```
+
+```{r, eval = F}
+plot_umap(so, "gg_tumor_res.0.5", legend_title = "clusters") 
+```
+
+### UPN after correction
+
+The clustering is now less strongly driven by each patient specific sample
+
+
+```{r, eval = FALSE}
+set.seed(seed_value)
+so <- so %>% 
+  RunHarmony(group.by.vars = "UPN", dims = 1:25) %>% 
+  RunUMAP(reduction = "harmony",
+              dims = 1:25,
+              reduction.name = "harmony_umap",
+              seed.use = seed_value) %>% 
+  FindNeighbors(reduction = "harmony", 
+                    dims = 1:25, 
+                    k.param = 20L, 
+                    verbose = FALSE) %>% 
+  FindClusters(resolution = seq(0.1, 1, 0.2),
+               verbose = FALSE,
+               random.seed = seed_value)
+
+col_idx <- match(paste0("gg_tumor_harmony_res.", seq(0.1, 1, 0.2)), colnames(so@meta.data)) 
+so@meta.data[, col_idx] <- NULL
+
+colnames(so@meta.data)[match(paste0("RNA_snn_res.", seq(0.1, 1, 0.2)), colnames(so@meta.data))] <- paste0("gg_tumor_harmony_res.", seq(0.1, 1, 0.2))
+
+qsave(so, file.path("objects", "so_tumor_gg.qs"))
+```
+
+```{r}
+plot_harmony(so, "UPN")
+```
+
+
+```{r}
+plot_harmony(so, "gg_tumor_harmony_res.0.7", legend_title = "harmony-clusters") 
+```
+
+
+## Get markers 
+
+Markers are saved to excel spreadsheets.
+
+```{r}
+library(scran)
+so$Dx_simple <- ifelse(str_detect(so$Dx, "low grade glioma"),
+                       "low grade glioma",
+                       so$Dx)
+# temporary fix for issue #4639
+so_diet <- DietSeurat(so, graphs = "pca")
+sce <- as.SingleCellExperiment(so_diet)
+rm(so_diet)
+
+markers.cell_type.up <- findMarkers(sce, 
+                                groups = sce$gg_tumor_harmony_res.0.7, 
+                                block = sce$orig.ident,
+                                lfc = 0.5,
+                                direction="up") %>% 
+  lapply(., as.data.frame) %>%
+  map(~rownames_to_column(.x, "gene") %>% 
+        filter(FDR < 0.05))
+
+markers.cell_type.up %>% 
+  bind_rows(.id = "cluster") %>% 
+  write_tsv(file.path(mkrs_dir, "scran_gg_tumor_consensus_cluster_markers.tsv"))
+
+map(markers.cell_type.up, 
+    ~set_xlsx_class(.x, "gene", "Text")) %>% 
+openxlsx::write.xlsx(., file.path(mkrs_dir, "scran_gg_tumor_consensus_cluster_markers.xlsx"),
+                     overwrite = TRUE)
+```
+
+
+
+```{r}
+mkrs <- get_marker_summaries(so, 
+                     "gg_tumor_harmony_res.0.7", 
+                     outdir = mkrs_dir, 
+                     min_pct = 10,
+                     prefix = "gg_harmony")
+topx <- mkrs$mkrs %>% 
+  filter(logFC > 0, padj < 0.05) %>% 
+  mutate(group = factor(group, levels = sort(unique(so$gg_tumor_harmony_res.0.7)))) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE) %>% 
+  dplyr::slice(1:10) 
+```
+
+
+
+### Summary Table 
+
+
+Shown below are the top 10 markers of each cell population in a table, heatmap, and projected onto a UMAP.
+
+```{r, rows.print = 15, columns.print = 15}
+topx %>% 
+  dplyr::select(feature, group) %>% 
+  group_by(group) %>% 
+  mutate(id = row_number()) %>% 
+  pivot_wider(names_from = "group",
+              values_from = "feature") %>%
+  dplyr::select(-id) 
+```
+
+### Heatmap 
+
+Top 10 markers per cluster.
+
+```{r, fig.width = 9, fig.height= 22, warning = FALSE, message = FALSE, fig.cap = "Heatmap of top markers of each cluster"}
+topx_features <- topx %>% 
+  pull(feature)
+
+hm <- plot_heatmap(ScaleData(so, features =  topx_features),
+             unique(topx_features), 
+             group = "gg_tumor_harmony_res.0.7",
+             average = TRUE,
+             hmap_options = list(column_names_rot = 90,
+                                 col = viridis::magma(256)))
+
+# pdf(file.path(fig_dir,
+#               "coarse_clusters_marker_heatmap.pdf"),
+#     height = 18,
+#     width = 9)
+draw(hm)
+# a <- dev.off(); rm(a)
+# 
+# hm
+```
+
+
+### UMAP
+Top 5 markers per cluster.
+```{r, fig.width = 12, fig.height = 32, eval = F}
+mkr_list <- topx %>% 
+  dplyr::slice(1:5) %>% 
+  split(., .$group) %>% 
+  map(~pull(.x, feature))
+
+plot_montage(so, 
+             ncols = 5,
+             mkr_list, 
+             plot_fxn = plot_harmony)
+```
+
+
+## Cluster descriptions
+
+
+
+```{r, fig.height= 12, fig.width=6}
+library(clustifyr)
+library(clustifyrdatahub)
+library(canatlas)
+
+ref_cortex_dev_local <- ref_cortex_dev()
+ref_cerebellar <- canatlas::fetal_cerebellum 
+
+atlas <- list(
+  `cortex_development` = ref_cortex_dev_local,
+  `cerebellar_development` = ref_cerebellar,
+  `MB_immune` = canatlas::mb_atlas$immune,
+  `MB` = canatlas::mb_atlas$tumor,
+  `EPN_immune` = canatlas::epn_atlas$immune,
+  `EPN` = canatlas::epn_atlas$tumor,
+  `cortex` = canatlas::human_cortex,
+  `pbmc` = canatlas::hpbmc[[2]]
+)
+
+mb_ids <- tibble(short_id = str_match(colnames(canatlas::mb_atlas$immune),
+                            "\\((.+)\\)")[, 2], 
+       long_id = str_remove(colnames(canatlas::mb_atlas$immune), 
+                            " \\(.+\\)"), 
+       original_id = colnames(canatlas::mb_atlas$immune),
+       atlas_id = str_c(short_id))
+colnames(atlas[["MB_immune"]]) <- mb_ids$atlas_id
+atlas <- imap(atlas, 
+              ~{colnames(.x) <- str_replace_all(colnames(.x), " ", "-") %>%
+    str_remove("[0-9]{2}-") %>% 
+    str_replace_all("-", "_") %>% 
+    str_c(".", .y)
+              .x})
+
+to_keep <- Reduce(intersect, map(atlas, rownames)) 
+atlas <- map(atlas, ~.x[to_keep, ]) %>% unname() %>% do.call(cbind, .)
+
+res <- clustify(so,
+                ref_mat = atlas, query_genes = VariableFeatures(so)[1:1000],
+                cluster_col = "gg_tumor_harmony_res.0.7", 
+                obj_out = FALSE,
+                method = "pearson")
+
+hmap_mat <- t(res) %>% 
+  .[rowSums(. > 0.5) > 0, ]
+
+hmap <- Heatmap(hmap_mat,
+        name = "Spearman\ncorrelation",
+        row_title = "Reference cell types",
+        row_names_gp = gpar(fontsize = 6),
+        column_title = "Coarse clusters",
+        column_title_side = "bottom",
+        col = viridis::magma(256))
+
+draw(hmap)
+```
+
+```{r}
+top_calls <- rownames_to_column(as.data.frame(res), "cluster") %>% 
+  pivot_longer(cols = -cluster) %>% 
+  group_by(cluster) %>% 
+  arrange(desc(value)) %>% 
+  dplyr::slice(1:5) %>% 
+  ungroup() %>% 
+  mutate(cluster = factor(cluster, levels = as.character(sort(as.numeric(unique(cluster))))))  %>% 
+  arrange(cluster) %>% 
+  group_by(cluster) %>% 
+  mutate(called_cell_type = str_c(name, " (", signif(value, 3), ")"),
+         row_id = row_number()) %>% 
+  select(cluster, 
+         called_cell_type,
+         row_id) %>% 
+  pivot_wider(names_from = cluster,
+              values_from = called_cell_type) %>% 
+  select(-row_id)
+top_calls
+```
+Shown below is the top  most correlated cell type for each cluster. Any reference celltype with a correlation < 0.6 will be annotated as unassigned. 
+
+```{r}
+top_call <- cor_to_call(res, threshold = 0.6) %>%  
+  select(cluster, 
+         called_cell_type = type, 
+         correlation_value = r)
+top_call
+```
+
+## Gene signatures
+
+### Hypoxia
+
+
+```{r}
+gene_sets <- list(
+  hypoxia_genes = c("VEGFA",
+                   "SLC2A1",
+                   "PGAM1",
+                   "ENO1",
+                   "LDHA",
+                   "TPI1",
+                   "P4HA1",
+                   "MRPS17",
+                   "CDKN3",
+                   "ADM",
+                   "NDRG1",
+                   "TUBB6",
+                   "ALDOA",
+                   "MIF"))
+
+if(any(str_c(names(gene_sets), "_signature") %in% colnames(so@meta.data))){
+  out_cols <- str_c(names(gene_sets), "_signature")
+  to_drop <- match(out_cols, colnames(so@meta.data))
+  so@meta.data[, to_drop] <- NULL
+}
+
+for (i in seq_along(gene_sets)){
+  so <- AddModuleScore(so, 
+                       features = list(c(gene_sets[[i]])),
+                       ctrl = 50,
+                       name = names(gene_sets)[i],
+                       seed = 42)
+}
+
+new_ids <- str_c(make.names(names(gene_sets)), "1") 
+new_id_idx <- match(new_ids, colnames(so@meta.data))
+colnames(so@meta.data)[new_id_idx] <- str_c(names(gene_sets), "_signature")
+```
+
+```{r}
+plot_harmony(so, str_c(names(gene_sets), "_signature"))
+```
+
+The hypoxia signature includes `r str_c(gene_sets$hypoxia_genes, collapse = ",")`  
+
+
+Shown below are gene signatures from the `Reitman et al` paper. 
+
+```{r}
+plot_harmony(so, "PA_MAPK")
+```
+
+```{r}
+plot_harmony(so, "PA_AC.like")
+```
+
+```{r}
+plot_harmony(so, "PA_OC.like")
+```
+
+
+## Go Terms
+
+```{r}
+library(gprofiler2)
+library(ggrepel)
+# Use top 200 markers 
+mkrs <- read_tsv(file.path("markers", 
+                           "gg_harmony_cluster_markers.tsv")) %>% 
+  filter(logFC > 0,
+         pct_in > 10,
+         padj < 0.05) %>% 
+  group_by(group) %>% 
+  dplyr::slice(1:200)
+mkrs_split <- split(mkrs, mkrs$group) %>% 
+  map(~pull(.x, feature))
+go_res <- gost(mkrs_split, 
+               ordered_query = TRUE,
+               sources = c("GO", 
+                          "KEGG", 
+                          "REAC", 
+                          "TF"))
+go_res[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ",")))) %>% 
+  write_tsv(., file.path(tbls_dir, "goterms_gg_harmony_clusters.tsv"))
+go_res[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ","))),
+         source = str_replace_all(source, "[[:punct:]]", " ")) %>% 
+  select(-significant) %>% 
+  split(., .$query) %>% 
+  openxlsx::write.xlsx(., 
+                       file.path(tbls_dir, "goterms_gg_harmony_clusters.xlsx"),
+                       overwrite = TRUE)
+```
+
+```{r}
+go_res_all <- gost(mkrs_split, 
+               ordered_query = TRUE, 
+               significant = FALSE,
+               sources = c("GO", 
+                          "KEGG", 
+                          "REAC", 
+                          "TF"))
+go_res_to_plot <- go_res_all[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ","))),
+         source = str_replace_all(source, "[[:punct:]]", " ")) %>% 
+  select(-significant) 
+```
+
+```{r, fig.height = 9, fig.width = 9}
+dbs <- c("GO BP", "GO MF", "GO CC", "REAC", "KEGG")
+top_n_terms <- 10
+gterm_hmaps <- map(dbs,
+    ~{
+  res <- filter(go_res_to_plot, 
+                   source == .x,
+                   p_value < 0.05) %>% 
+    group_by(query) %>% 
+    arrange(p_value, .by_group = TRUE) %>% 
+    dplyr::slice(1:top_n_terms)
+  
+  to_plot <- filter(go_res_to_plot,
+                    source == .x,
+                    term_name %in% res$term_name,
+                    query %in%  unique(res$query)) %>%
+    select(query, p_value, term_name) %>% 
+    pivot_wider(names_from = query, values_from = p_value) %>% 
+    column_to_rownames("term_name") %>% 
+    as.matrix() 
+  
+  to_plot[is.na(to_plot)] <- 1
+  to_plot <- -log10(to_plot)
+  hmap <- Heatmap(to_plot, 
+          name = "-log10(pvalue)",
+          column_title = .x,
+          column_order = unique(res$query),
+          row_order = unique(res$term_name),
+          col = viridis::magma(256),
+          cluster_columns = TRUE, 
+          cluster_rows = FALSE, 
+          row_names_side = "left",
+          row_names_gp = gpar(fontsize = 8))
+  hmap
+})
+walk(gterm_hmaps, draw)
+```
+
+```{r}
+lake_markers <- list(
+  Ast = c("RYR3", "GPC5", "RNF219-AS1", "GFAP", "NRG3", "HPSE2", "RP11-627D16.1", "NTM", "FGFR3", "MGAT4C", "IQCA1", "DAAM2", "AC012593.1", "PTGDS", "CAMK2G", "PITPNC1", "NPAS3", "PPP2R2B", "CTNND2", "CTNNA2", "SFXN5", "DST", "CDH20", "LINC01088", "ATP1A2", "FBXL7", "TENM2", "RP11-384F7.2", "MIR4300HG", "NKAIN3", "SASH1", "WWC1", "CABLES1", "TRPM3", "PCDH9", "GRIA1", "MACF1", "BMPR1B", "C1orf61", "LSAMP", "MSI2", "NDRG2", "MT3", "CHD9", "PRKCA", "RPS6KA2", "PDZRN4", "BCL2", "SLC4A4", "PLEKHA5", "BAZ2B", "FAT3", "ITPR2", "LGI4", "FMN2", "SLC1A2", "PTPRT", "SLC39A11", "ST6GALNAC3", "CPEB4", "MAPK10", "DCLK1", "PRKG1", "GABBR1", "NEBL", "NCAM2", "DGKG", "MIR99AHG", "LMCD1-AS1", "NTRK2", "DTNA", "TMEM108", "SNRNP70", "CLU", "ZHX3", "TNIK", "MKLN1", "FAM19A5", "SREK1", "GPM6B", "WWOX", "GOLGB1", "NAV2", "FUT9", "GPM6A", "SORBS1", "DOCK4", "LAMA2", "NEAT1", "SHISA6", "HS6ST3", "ZFAND3", "NCKAP5", "FNBP1", "AGBL4", "RP11-886D15.1", "ANKRD12", "NCAM1", "SBF2"),
+  Ast_Cer = c("GRIA1", "SLC1A3", "SLC4A4", "PPP2R2B", "NPAS3", "GABRB1", "LAMA2", "PCDH9", "ANK2", "LRRTM4", "XYLT1", "CTNNA3", "DTNA", "LGI4", "CDH20", "C1orf61", "ALDH1A1", "FGFR2", "NRG3", "NDRG2", "PRKCA", "GABRG3", "GPM6A", "RYR3", "ATP1A2", "NCKAP5", "PDE4D", "GRID2", "PREX2", "EGFEM1P", "NCAM2", "CTNND2", "PCSK6", "RP11-776H12.1", "GABRA2", "FAT3", "RP5-947P14.1", "PTN", "ADCY2", "GRM5", "RP11-886D15.1", "C10orf11", "STK32A", "LMCD1-AS1", "BMPR1B", "ATP10B", "CHL1", "RGS20", "TRPS1", "TRPM3", "NHSL1", "SEPT4", "ADAMTSL1", "PAX3", "MCC", "PITPNC1", "ESRRG", "GRM3", "WDR49", "CACHD1", "STARD13", "KIAA1217", "SLC1A2", "SFXN5", "RP11-460M2.1", "GRIK4", "PTPRZ1", "GPM6B", "PIK3C2A", "ARHGAP31", "QKI", "GPC5", "SNED1", "COLEC12", "PREX1", "TNIK", "PARD3B", "PTPRM", "TMEM108", "PDZRN4", "SLC38A1", "MAGI2", "GPC6", "LSAMP", "RP11-141M1.3", "MGAT4C", "SCD5", "RPS6KA2", "ADGRL3", "SOX5", "SRGAP1", "ARAP2", "SPARCL1", "COL23A1", "SPOCK3", "LRP1B", "SLC35F1", "SOX6", "ADAMTSL3", "PTGDS", "ITPR2"),
+  Oli = c("PLP1", "RNF220", "MBP", "IL1RAPL1", "MOBP", "ST18", "SLC44A1", "TF", "PEX5L", "CERCAM", "PCDH9", "SLC24A2", "QKI", "SLC5A11", "CTNNA3", "CNDP1", "TMEM144", "EDIL3", "CARNS1", "ENPP2", "PDE8A", "FRMD4B", "PIP4K2A", "DOCK5", "NCKAP5", "MAN2A1", "LINC01608", "MOG", "FRMD5", "MYRF", "PPP2R2B", "SYNJ2", "DOCK10", "CLDN11", "UGT8", "PLCL1", "LINC00609", "QDPR", "KCNH8", "PLEKHH1", "PHLPP1", "SHTN1", "ZEB2", "PTGDS", "DAAM2", "PXK", "AK5", "C10orf90", "CNTN2", "CCDC88A", "CNP", "DPYD", "PDE4B", "SPOCK3", "MAP4K4", "DLG2", "TTLL7", "LPAR1", "SHROOM4", "GAB1", "BCAS1", "ABCA2", "MARCH1", "PLD1", "FMNL2", "ALCAM", "SCD", "ERBB2IP", "AC012593.1", "TMTC2", "COL4A5", "ARAP2", "PDE1C", "TRIM2", "POLR2F", "ELMO1", "SIK3", "MAP7", "DLG1", "APLP1", "TCF12", "TMEM165", "SORT1", "GPM6B", "SEPT7", "ENOX1", "MYO1D", "FRYL", "DSCAML1", "ANO4", "AGPAT4", "DLC1", "DST", "PSEN1", "ZDHHC20", "PTPRD", "LIMCH1", "PRUNE2", "SH3GL3", "GNG7", "NPAS3"),
+  OPC = c("LHFPL3", "DSCAM", "TNR", "PCDH15", "LRRC4C", "LUZP2", "SEMA5A", "SOX6", "ATRNL1", "LRRTM4", "GRIK1", "OPCML", "PTPRZ1", "PDZD2", "CHST11", "PCDH9", "MDGA2", "DCC", "BCAS1", "GRM7", "OPHN1", "XYLT1", "TMEM132D", "PCDH7", "LRP1B", "DPP10", "CSMD3", "MMP16", "SHISA9", "EPN2", "CSMD1", "SLC35F1", "KIF13A", "NRCAM", "NXPH1", "CDH13", "TMEM132C", "SMOC1", "NKAIN3", "RP11-384F7.2", "LRRC7", "PDZRN4", "NPAS3", "AGAP1", "VCAN", "LINC00511", "SOX2-OT", "PLPPR1", "HIP1", "ADAMTS17", "NAV1", "SCD5", "ALCAM", "PRKCA", "QKI", "NCAM2", "CHL1", "SGCD", "MARCH1", "SOX5", "GRM5", "ASAP1", "PDE4B", "PID1", "HS6ST3", "NRG3", "DSCAML1", "SNTG1", "ADARB2", "NCKAP5", "APBB2", "NAV2", "KAZN", "KCNMA1", "NOVA1", "BCAN", "SH3D19", "NTM", "C10orf11", "DOCK10", "SCN1A", "CDH20", "PPP2R2B", "BRINP3", "KAT2B", "IL1RAPL1", "UST", "TANC2", "LSAMP", "ITPR2", "CACNA2D3", "ANO4", "MEGF11", "CNTNAP5", "PREX2", "SEZ6L", "PEAK1", "PLCB1", "NCAM1", "ERBB4", "TAOK3"),
+  OPC_Cer = c("ORAOV1", "AC007682.1", "KCNQ1OT1", "PCDH15", "DLGAP1", "ALCAM", "SOX5", "SOX2-OT", "SOX6", "GLCCI1", "NOVA1", "NOVA1-AS1", "CNTN3", "ZEB1", "LINC00609", "TPCN2", "PTPRZ1", "EYA1", "CADM2", "MAML2", "IGF1R", "NXPH1", "SMOC1", "TCF12", "PCDH11X", "PCDH17", "MMP16", "ADGRL3", "CALCRL", "MKRN3", "CTC-340A15.2", "SLC35F1", "NKAIN3", "QKI", "ETV1", "RP11-166D19.1", "GPC6", "PARD3", "MEF2A", "LRP6", "CLSTN2", "ROBO2", "MDGA2", "CCND2", "SCAPER", "PBX3", "ZEB2", "SLC44A5", "TCF4", "PLCB1", "STK3", "MAP2", "MARCH1", "KALRN", "IRS2", "MARCH3", "EPB41L2", "RCN2", "NPAS3", "NOL4", "DOCK10", "KHDRBS3", "PRKD1", "TTC28", "ROBO1", "ATF7IP", "FYN", "DLEU2", "CLASP2", "CHD7", "SH3D19", "DST", "ZBTB20", "ZNF462", "CACNA2D1", "PHLPP1", "EGFEM1P", "PDE4B", "PTPRK", "CDH2", "MIR99AHG", "LRRC28", "PTN", "DGKB", "MEIS2", "TMEFF2", "DHX36", "FAT3", "ARL15", "EIF4G3", "ZNF644", "PIK3R1", "CNTRL", "NAV2", "UBA6-AS1", "PTBP2", "PHF14", "GRIA4", "AC004980.7", "NCAM1", "SLC2A13"),
+ purk = c("GRID2", "RORA", "PTPRK", "GRM1", "ADGRL3", "EML5", "INPP4B", "UNC5C", "SORCS3", "PHACTR2", "FRMPD4", "VCAN", "SYN3", "KCTD8", "MEGF10", "ZNF521", "SIPA1L3", "RYR1", "ESRRG", "NFIA", "CA10", "VAV3", "NRXN1", "LMCD1", "ZFPM2", "TFAP2B", "SPOCK1", "EXPH5", "KCNIP4", "CLMP", "NBEA", "RP11-886D15.1", "UNC5D", "TMEM117", "MARCH11", "PLCH1", "TRPM3", "UNC13C", "HECW1", "TIAM1", "ADGRB3", "PLCB4", "SYT2", "MAML2", "INADL", "SLC24A3", "GRIA4", "SHISA6", "FAM155A", "DGKH", "SRRM3", "FRMD3", "GRM3", "LHFPL3", "FGF14", "ZBTB20", "PPM1L", "SHANK2", "CACNA1A", "EPB41", "NOS1", "NOS1AP", "RNU6-6P", "KCNMA1", "DPP6", "SYNDIG1", "MACROD2", "PRKG1", "KIT", "NLGN1", "FRMD4A", "ARHGEF10L", "DPF3", "ADAM12", "PRKCG", "RAB31", "GRID1", "CACNA1D", "TSPAN5", "XIST", "CNTNAP4", "TRPC5", "APPL2", "FSTL4", "NKAIN2", "PAK7", "MPPED2", "BCAN", "CACNG2", "CADPS2", "PTPRR", "IQCA1", "ADAM11", "DGKI", "PPP2R3A", "NTM", "CADM3", "JMJD1C", "CHN2", "GRIA3", "ITGAV")
+
+)
+
+if(any(str_c(names(lake_markers), "_signature") %in% colnames(so@meta.data))){
+  out_cols <- str_c(names(lake_markers), "_signature")
+  to_drop <- match(out_cols, colnames(so@meta.data))
+  so@meta.data[, to_drop] <- NULL
+}
+
+
+for (i in seq_along(lake_markers)){
+  so <- AddModuleScore(so, 
+                       features = list(c(lake_markers[[i]])),
+                       ctrl = 50,
+                       name = names(lake_markers)[i],
+                       seed = 42)
+}
+
+new_ids <- str_c(make.names(names(lake_markers)), "1") 
+new_id_idx <- match(new_ids, colnames(so@meta.data))
+colnames(so@meta.data)[new_id_idx] <- str_c(names(lake_markers), "_signature")
+```
+
+```{r}
+plot_harmony(so, str_c(names(lake_markers), "_signature"), show_negative = T)
+```
+
+```{r, fig.width=9, fig.height=9}
+huang_et_al <- list(
+  OPC = c("OLIG1", "OLIG2", "PDGFRA", "NKX2-2", "SOX10", "APOD"),
+  Neuronal = c("EOMES", "PPP1R17", "NEUROD2"),
+  PreOPC = c("GFAP", "VIM", "NES", "HES1", "NOTCH2", "EGFR")
+)
+
+plot_montage(so, 
+             ncols = 6,
+             huang_et_al, 
+             plot_fxn = plot_harmony)
+```
+
+## Cell counts and changes in cell proportions between tumor types
+
+```{r, fig.width = 7}
+plot_harmony(so, 
+             "gg_tumor_harmony_res.0.7",
+             group = "UPN",
+             legend_title = "") 
+```
+
+```{r, rows.print = 50}
+cell_count_mat <- get_cell_count_matrix(so, "UPN", "gg_tumor_harmony_res.0.7") %>% 
+  rownames_to_column("tumor") 
+write_csv(cell_count_mat, file.path(tbls_dir, "gg_tumor_harmony_cell_counts.csv"))
+cell_count_mat
+```
+
+
+```{r}
+plot_cell_proportions(so, 
+                      sample_id = "UPN",
+                      group_id = "gg_tumor_harmony_res.0.7"
+                      ) +
+  labs(x = "UPN",
+       fill = "")
+```
+```{r}
+plot_cell_proportions(so, 
+                      sample_id = "gg_tumor_harmony_res.0.7",
+                      group_id = "UPN"
+                      ) +
+  labs(x = "clusters",
+       fill = "")
+```
+
+## Conclusions
+
+```{r}
+plot_harmony(so, "UPN")
+```
+
+```{r}
+plot_harmony(so, "gg_tumor_harmony_res.0.7")
+```
+
+```{r, fig.width=9, fig.height=9}
+plot_violins(so, 
+             "gg_tumor_harmony_res.0.7",
+             features = c("hypoxia_genes_signature",
+                          "PA_MAPK",
+                          "PA_AC.like",
+                          "OPC_Cer_signature",
+                          "OPC_signature",
+                          "Ast_Cer_signature",
+                          "Ast_signature",
+                          "Oli_signature"))
+```
+
+```{r}
+old_labels <- so_old$gg_subpopulation[intersect(colnames(so), colnames(so_old))]
+                        
+so$old_cluster_labels <- old_labels[colnames(so)]
+
+plot_harmony(so, "old_cluster_labels")
+
+```
+```{r}
+plot_harmony(so, "gg_tumor_harmony_res.0.7")
+```
+
+```{r}
+table(so$old_cluster_labels, so$gg_tumor_harmony_res.0.7)
+```
+
+
+```{r}
+# gg_subpopulation <- c(
+#   "0" = "PDGFRA+",
+#   "1" = "PDGFRA+ Cell-cycle arrest (CDKN1/2+)",
+#   "2" = "Neuron? (RBFOX3+ ZIC1+ BOC+ STMN2+)",
+#   "3" = "PDGFRA+",
+#   "4" = "Astrocyte? AQP1/4+ CLU+",
+#   "5" = "PDGFRA+ PCDHGA+",
+#   "6" = "Neuron? (STMN1+ GABRG2+ CHGA/B+ EOMES+)",
+#   "7" = "Olig (mature)",
+#   "8" = "doublets-to-exclude",
+#   "9" = "t-cells-to-exclude"
+# )
+
+gg_subpopulation <- c(
+  "0" = "PDGFRA+",
+  "1" = "Neuron? (RBFOX3+ ZIC1+ BOC+ STMN2+)",
+  "2" = "PDGFRA+ Cell-cycle arrest (CDKN1/2+)",
+  "3" = "doublets-to-exclude",
+  "4" = "PDGFRA+ Cell-cycle arrest (CDKN1/2+)",
+  "5" =  "Astrocyte? AQP1/4+ CLU+",
+  "6" = "PDGFRA+",
+  "7" = "PDGFRA+ PCDHGA+",
+  "8" = "Astrocyte? AQP1/4+ CLU+",
+  "9" = "Neuron? (STMN1+ GABRG2+ CHGA/B+ EOMES+)",
+  "10"= "PDGFRA+ Cell-cycle arrest (CDKN1/2+)",
+  "11" = "t-cells-to-exclude",
+  "12" = "Olig (mature)"
+)
+
+so$gg_subpopulation <- gg_subpopulation[as.character(so$gg_tumor_harmony_res.0.7)]
+```
+
+```{r, fig.width=7}
+p <- plot_harmony(so, "gg_subpopulation")
+p
+save_plot(file.path(fig_dir, "umap_subpopulations.pdf"), p, base_asp = 2)
+```
+
+```{r, fig.width=7}
+so <- subset(so, subset = gg_subpopulation %in% c("t-cells-to-exclude",
+                                                  "doublets-to-exclude"),
+             invert = T)
+
+p <- plot_harmony(so, "gg_subpopulation")
+p
+
+save_plot(file.path(fig_dir, "umap_subpopulations.pdf"), p, base_asp = 2)
+```
+
+```{r, fig.width=7}
+p <- plot_harmony(so, "PDGFRA")
+p
+save_plot(file.path(fig_dir, "umap_PDGFRA_gg.pdf"), p, base_asp = 1.4)
+```
+
+```{r, fig.width=7}
+p <- plot_harmony(so, c("RBFOX3", "EOMES", "ZIC1", "BOC")) %>% 
+  plot_grid(plotlist = ., nrow = 2, ncol = 2)
+p
+save_plot(file.path(fig_dir, "umap_neuronal_gg.pdf"), p, nrow = 2, ncol = 2, base_asp = 1)
+
+
+p <- plot_harmony(so, c("STMN1", "STMN2", "CHGA", "CHGB")) %>% 
+  plot_grid(plotlist = ., nrow = 2, ncol = 2)
+p
+save_plot(file.path(fig_dir, "umap_neuronal2_gg.pdf"), p, nrow = 2, ncol = 2, base_asp = 1)
+```
+
+
+```{r}
+mkrs <- get_marker_summaries(so, 
+                     "gg_subpopulation", 
+                     outdir = mkrs_dir, 
+                     min_pct = 10,
+                     prefix = "gg_subpop_harmony")
+```
+
+
+## Go Terms
+
+```{r}
+library(gprofiler2)
+library(ggrepel)
+# Use top 200 markers 
+mkrs <- read_tsv(file.path("markers", 
+                           "gg_subpop_harmony_cluster_markers.tsv")) %>% 
+  filter(logFC > 0,
+         pct_in > 10,
+         padj < 0.05) %>% 
+  group_by(group) %>% 
+  dplyr::slice(1:200)
+mkrs_split <- split(mkrs, mkrs$group) %>% 
+  map(~pull(.x, feature))
+go_res <- gost(mkrs_split, 
+               ordered_query = TRUE,
+               sources = c("GO", 
+                          "KEGG", 
+                          "REAC", 
+                          "TF"))
+go_res[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ",")))) %>% 
+  write_tsv(., file.path(tbls_dir, "goterms_gg_harmony_clusters.tsv"))
+go_res[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ","))),
+         source = str_replace_all(source, "[[:punct:]]", " "),
+         query = str_sub(query, 1, 31)) %>% 
+  select(-significant) %>% 
+  split(., .$query) %>% 
+  openxlsx::write.xlsx(., 
+                       file.path(tbls_dir, "goterms_gg_harmony_subpopulations.xlsx"),
+                       overwrite = TRUE)
+```
+
+```{r}
+go_res_all <- gost(mkrs_split, 
+               ordered_query = TRUE, 
+               significant = FALSE,
+               sources = c("GO", 
+                          "KEGG", 
+                          "REAC", 
+                          "TF"))
+go_res_to_plot <- go_res_all[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ","))),
+         source = str_replace_all(source, "[[:punct:]]", " ")) %>% 
+  select(-significant) 
+```
+
+```{r, fig.height = 9, fig.width = 9}
+dbs <- c("GO BP", "GO MF", "GO CC", "REAC", "KEGG")
+top_n_terms <- 10
+gterm_hmaps <- map(dbs,
+    ~{
+  res <- filter(go_res_to_plot, 
+                   source == .x,
+                   p_value < 0.05) %>% 
+    group_by(query) %>% 
+    arrange(p_value, .by_group = TRUE) %>% 
+    dplyr::slice(1:top_n_terms)
+  
+  to_plot <- filter(go_res_to_plot,
+                    source == .x,
+                    term_name %in% res$term_name,
+                    query %in%  unique(res$query)) %>%
+    select(query, p_value, term_name) %>% 
+    pivot_wider(names_from = query, values_from = p_value) %>% 
+    column_to_rownames("term_name") %>% 
+    as.matrix() 
+  
+  to_plot[is.na(to_plot)] <- 1
+  to_plot <- -log10(to_plot)
+  hmap <- Heatmap(to_plot, 
+          name = "-log10(pvalue)",
+          column_title = .x,
+          column_order = unique(res$query),
+          row_order = unique(res$term_name),
+          col = viridis::magma(256),
+          cluster_columns = TRUE, 
+          cluster_rows = FALSE, 
+          row_names_side = "left",
+          row_names_gp = gpar(fontsize = 8))
+  hmap
+})
+walk(gterm_hmaps, draw)
+```
+
+
+## Cell counts and changes in cell proportions between tumor types
+
+```{r, fig.width = 7}
+plot_harmony(so, 
+             "gg_subpopulation",
+             group = "UPN",
+             legend_title = "") 
+```
+
+```{r, rows.print = 50}
+cell_count_mat <- get_cell_count_matrix(so, "UPN", "gg_subpopulation") %>% 
+  rownames_to_column("tumor") 
+write_csv(cell_count_mat, file.path(tbls_dir, "gg_tumor_harmony_subpopulation_cell_counts.csv"))
+cell_count_mat
+```
+
+
+```{r}
+p <- plot_cell_proportions(so, 
+                      sample_id = "UPN",
+                      group_id = "gg_subpopulation"
+                      ) +
+  labs(x = "UPN",
+       fill = "")
+
+p
+
+# save_plot(file.path(fig_dir, "gg_subpop_cell_proportions.pdf"),
+#           p,base_height = 6,
+#           base_asp = 1.1)
+```
+
+```{r}
+p <- plot_cell_proportions(so, 
+                      sample_id = "gg_subpopulation",
+                      group_id = "UPN"
+                      ) +
+  labs(x = "clusters",
+       fill = "")
+
+p
+
+save_plot(file.path(fig_dir, "gg_subpop_cell_proportions.pdf"),
+          p,base_height = 6,
+          base_asp = 1.1)
+```
+
+```{r}
+library(scran)
+so$Dx_simple <- ifelse(str_detect(so$Dx, "low grade glioma"),
+                       "low grade glioma",
+                       so$Dx)
+# temporary fix for issue #4639
+so_diet <- DietSeurat(so, graphs = "pca")
+sce <- as.SingleCellExperiment(so_diet)
+rm(so_diet)
+
+markers.cell_type.up <- findMarkers(sce, 
+                                groups = sce$gg_subpopulation, 
+                                block = sce$orig.ident,
+                                lfc = 0.5,
+                                direction="up") %>% 
+  lapply(., as.data.frame) %>%
+  map(~rownames_to_column(.x, "gene") %>% 
+        filter(FDR < 0.01))
+
+markers.cell_type.up %>% 
+  bind_rows(.id = "cluster") %>% 
+  write_tsv(file.path(mkrs_dir, "scran_gg_tumor_subpopulation_consensus_markers.tsv"))
+
+names(markers.cell_type.up) <- str_sub(names(markers.cell_type.up), 1, 31) %>% 
+  str_replace_all(., "[[:punct:]]", " ")
+map(markers.cell_type.up, 
+    ~set_xlsx_class(.x, "gene", "Text")) %>% 
+openxlsx::write.xlsx(., file.path(mkrs_dir, "scran_gg_tumor_subpopulation_consensus_markers.xlsx"),
+                     overwrite = TRUE)
+
+```
+
+## Clustrees
+
+```{r}
+library(clustree)
+p <- clustree(so, prefix = "gg_tumor_harmony_res.") +
+  scale_color_manual(values = discrete_palette_default)
+p
+save_plot(file.path(fig_dir, "gg_harmony_clustree_0.7_selected.pdf"), 
+          p,
+          base_asp = 1.5,
+          base_height = 8)
+```
+
+## Save data
+
+```{r, eval = TRUE}
+qsave(so, file.path("objects", "so_tumor_gg2.qs"))
+#so <- qread(file.path("objects", "so_tumor_gg2.qs"))
+```
+
+## Session info
+
+```{r}
+sessioninfo::session_info()
+```

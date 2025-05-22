@@ -1,0 +1,575 @@
+---
+title: "Analysis of t-cell populations"
+author: "Kent Riemondy RBI"
+date: "`r Sys.Date()`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "html") })
+output:
+  html_document:
+    theme: yeti
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    highlight: kate
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+
+```{r, message = FALSE}
+# source(here::here("src/utils.R"))
+source(here::here(file.path("..", "..", "..", "src/utils.R")))
+
+seed_value <- 20210805
+library(ggbeeswarm)
+library(ggpubr)
+library(rstatix)
+```
+
+```{r}
+so <- qread(file.path("objects", "so_lym.qs"), nthreads = 4)
+```
+
+```{r}
+is_old_mdata <- all(so@meta.data[so$UPN == "1455",c("Dx")] == "low grade glioma FGFR mutant")
+if(is_old_mdata){
+  so@meta.data[so$UPN == "1455", "Dx"] <- "ganglioglioma"
+  so@meta.data[so$UPN == "1455", "Dx_simple"] <-"ganglioglioma"
+  so@meta.data[so$UPN == "1171", "Dx"] <- "pilocytic astrocytoma"
+  so@meta.data[so$UPN == "1171", "Dx_simple"] <-"pilocytic astrocytoma"
+}
+```
+
+## Overview 
+
+### UPN
+
+The clustering is somewhat driven by each patient specific sample, so  batch correction will be necessary. We may also need to pursue a different approach based on clustering each patient sample individually then merging related profiles. 
+
+```{r}
+plot_umap(so, "UPN")
+```
+```{r}
+plot_umap(so, "t_res.0.3", legend_title = "clusters") 
+```
+
+### UPN after correction
+
+The clustering is now less strongly driven by each patient specific sample
+
+```{r}
+plot_harmony(so, "UPN")
+```
+```{r}
+plot_harmony(so, "t_harmony_res.0.3", legend_title = "harmony-clusters") 
+```
+
+## Compare cluster markers to immune related cell atlas {.tabset}
+
+I've been collating public single cell and related datasets into a resource to use as a reference to compare cell types across datasets. By comparing to an atlas we will be able to annotate cell types in the experiment with high confidence. 
+
+The reference datasets that I will use for this analysis include:
+
+Immune  cell types from our recent medulloblastoma paper in [NeuroOncology](https://academic.oup.com/neuro-oncology/advance-article/doi/10.1093/neuonc/noab135/6291352) . These cell types will have a suffix `MB` or `MB-immune`.  
+
+Immune  cell types from recent Ependymoma in [Cell Reports](https://www.sciencedirect.com/science/article/pii/S2211124720310081?via%3Dihub) . These celltypes will have a suffix of `EPN`  
+
+Lastly a dataset from PBMC will be included to identify lymphocytes, with a suffix of `pbmc`.  
+
+
+### Refined clusters
+
+First the refined clustering from the unaligned data will be compared. 
+
+```{r, fig.width=9, fig.height=9, message=FALSE, warning=FALSE, fig.cap="Heatmap showing the correlation coefficients of each cluster against various cell types from a diverse set of data."}
+library(clustifyr)
+library(clustifyrdatahub)
+library(canatlas)
+
+atlas <- list(
+  MB_immune = canatlas::mb_atlas$immune,
+  EPN_immune = canatlas::epn_atlas$immune,
+  pbmc = canatlas::hpbmc[[2]]
+)
+
+mb_ids <- tibble(short_id = str_match(colnames(canatlas::mb_atlas$immune),
+                            "\\((.+)\\)")[, 2], 
+       long_id = str_remove(colnames(canatlas::mb_atlas$immune), 
+                            " \\(.+\\)"), 
+       original_id = colnames(canatlas::mb_atlas$immune),
+       atlas_id = str_c(short_id))
+colnames(atlas[["MB_immune"]]) <- mb_ids$atlas_id
+atlas <- imap(atlas, 
+              ~{colnames(.x) <- str_replace_all(colnames(.x), " ", "-") %>%
+    str_remove("[0-9]{2}-") %>% 
+    str_replace_all("-", "_") %>% 
+    str_c(".", .y)
+              .x})
+
+to_keep <- Reduce(intersect, map(atlas, rownames)) 
+atlas <- map(atlas, ~.x[to_keep, ]) %>% unname() %>% do.call(cbind, .)
+
+res <- clustify(so,
+                ref_mat = atlas,
+                cluster_col = "t_harmony_res.0.3", 
+                obj_out = FALSE)
+
+hmap_mat <- t(res) %>% 
+  .[rowSums(. > 0.6) > 0, ]
+
+hmap <- Heatmap(hmap_mat,
+        name = "Spearman\ncorrelation",
+        row_title = "Reference cell types",
+        row_names_gp = gpar(fontsize = 6),
+        column_title = "Clusters",
+        column_title_side = "bottom",
+        col = viridis::magma(256))
+
+# pdf(file.path(fig_dir, "clustifyr_cell_type_annotation_heatmap_refined_clusters.pdf"),
+#     width = 9,
+#     height = 16)
+draw(hmap)
+# null <- dev.off()
+
+# hmap
+```
+
+<br>
+
+<br>
+
+Shown below are the top 5 most correlated cell types for each cluster. The correlation values are shown in parentheses. 
+
+```{r}
+top_calls <- rownames_to_column(as.data.frame(res), "cluster") %>% 
+  pivot_longer(cols = -cluster) %>% 
+  group_by(cluster) %>% 
+  arrange(desc(value)) %>% 
+  dplyr::slice(1:5) %>% 
+  ungroup() %>% 
+  mutate(cluster = factor(cluster, levels = as.character(sort(as.numeric(unique(cluster))))))  %>% 
+  arrange(cluster) %>% 
+  group_by(cluster) %>% 
+  mutate(called_cell_type = str_c(name, " (", signif(value, 3), ")"),
+         row_id = row_number()) %>% 
+  select(cluster, 
+         called_cell_type,
+         row_id) %>% 
+  pivot_wider(names_from = cluster,
+              values_from = called_cell_type) %>% 
+  select(-row_id)
+top_calls
+```
+Shown below is the top  most correlated cell type for each cluster. Any reference celltype with a correlation < 0.6 will be annotated as unassigned. 
+
+```{r}
+top_call <- cor_to_call(res, threshold = 0.6) %>%  
+  select(cluster, 
+         called_cell_type = type, 
+         correlation_value = r)
+top_call
+```
+
+
+```{r}
+if(!"t_cell_type" %in% colnames(so@meta.data)){
+  # add subcluster ids
+top_call_w_subclusters <- top_call %>%
+  group_by(called_cell_type) %>% 
+  mutate(n = n(),
+         simple_id = str_split(called_cell_type, fixed(".")) %>% 
+                map_chr(1), 
+         t_cell_type_subcluster = ifelse(
+           n == 1,
+           simple_id,
+           str_c(simple_id, "(", row_number(), ")"))) %>%
+  select(cluster,
+         t_cell_type = called_cell_type, 
+         t_cell_type_subcluster)
+
+so <- left_join(get_metadata(so), 
+          top_call_w_subclusters,
+          by = c("t_harmony_res.0.3" = "cluster")) %>% 
+ select(cell, t_cell_type, t_cell_type_subcluster) %>% 
+  column_to_rownames("cell") %>% 
+  AddMetaData(so, .)
+}
+
+
+plot_harmony(so, 
+          c("t_cell_type", "t_cell_type_subcluster"), 
+          legend_title = "",
+          sorted = "random") 
+```
+
+## Heatmap with annotated cell types
+
+Same heatmap as above but showing the annotated cell type rather than the cluster #s
+
+```{r, fig.width=9, fig.height=9,}
+res <- clustify(so,
+                ref_mat = atlas,
+                cluster_col = "t_cell_type_subcluster", 
+                obj_out = FALSE)
+
+hmap_mat <- t(res) %>% 
+  .[rowSums(. > 0.6) > 0, ]
+
+hmap <- Heatmap(hmap_mat,
+        name = "Spearman\ncorrelation",
+        row_title = "Reference cell types",
+        row_names_gp = gpar(fontsize = 6),
+        column_title = "Called cell type",
+        column_title_side = "bottom",
+        col = viridis::magma(256))
+
+# pdf(file.path(fig_dir, "clustifyr_cell_type_annotation_heatmap_refined_clusters.pdf"),
+#     width = 9,
+#     height = 16)
+draw(hmap)
+```
+  
+## Get markers 
+
+Markers are saved to excel spreadsheets.
+
+```{r}
+library(scran)
+so$Dx_simple <- ifelse(str_detect(so$Dx, "low grade glioma"),
+                       "low grade glioma",
+                       so$Dx)
+# temporary fix for issue #4639
+so_diet <- DietSeurat(so, graphs = "pca")
+sce <- as.SingleCellExperiment(so_diet)
+rm(so_diet)
+
+markers.cell_type.up <- findMarkers(sce, 
+                                groups = sce$t_cell_type, 
+                                block = sce$orig.ident,
+                                lfc = 0.5,
+                                direction="up") %>% 
+  lapply(., as.data.frame) %>%
+  map(~rownames_to_column(.x, "gene") %>% 
+        filter(FDR < 0.01))
+
+markers.cell_type.up %>% 
+  bind_rows(.id = "cluster") %>% 
+  write_tsv(file.path(mkrs_dir, "scran_t_cell_type_consensus_markers.tsv"))
+
+map(markers.cell_type.up, 
+    ~set_xlsx_class(.x, "gene", "Text")) %>% 
+openxlsx::write.xlsx(., file.path(mkrs_dir, "scran_t_cell_type_consensus_markers.xlsx"),
+                     overwrite = TRUE)
+
+markers.cell_type_sub.up <- findMarkers(sce, 
+                                groups = sce$t_cell_type_subcluster, 
+                                block = sce$orig.ident,
+                                lfc = 0.5,
+                                direction="up") %>% 
+  lapply(., as.data.frame) %>%
+  map(~rownames_to_column(.x, "gene") %>% 
+        filter(FDR < 0.01))
+
+
+markers.cell_type_sub.up %>% 
+  bind_rows(.id = "cluster") %>% 
+  write_tsv(file.path(mkrs_dir, "scran_t_cell_type_subcluster_consensus_markers.tsv"))
+
+map(markers.cell_type_sub.up, 
+    ~set_xlsx_class(.x, "gene", "Text")) %>% 
+openxlsx::write.xlsx(., file.path(mkrs_dir, "scran_t_cell_type_subcluster_consensus_markers.xlsx"),
+                     overwrite = TRUE)
+```
+
+
+```{r}
+mkrs <- get_marker_summaries(so, 
+                     "t_cell_type", 
+                     outdir = mkrs_dir, 
+                     min_pct = 10,
+                     prefix = "t_cell_type")
+```
+
+```{r}
+mkrs <- get_marker_summaries(so, 
+                     "t_cell_type_subcluster", 
+                     outdir = mkrs_dir, 
+                     min_pct = 10,
+                     prefix = "t_cell_type_subcluster")
+```
+
+
+## Cell counts and changes in cell proportions between tumor types
+
+```{r, fig.width = 7}
+plot_harmony(so, 
+             "t_cell_type_subcluster",
+             group = "Dx_simple",
+             legend_title = "") 
+```
+
+```{r, rows.print = 50}
+cell_count_mat <- get_cell_count_matrix(so, "UPN", "t_cell_type_subcluster") %>% 
+  rownames_to_column("tumor") 
+
+write_csv(cell_count_mat, file.path(tbls_dir, "t_cell_type_subcluster_cell_counts.csv"))
+cell_count_mat
+```
+
+```{r}
+per_patient <- group_by(get_metadata(so), UPN) %>%
+      mutate(n_cells = n()) %>%
+      group_by(UPN,
+               t_cell_type_subcluster,
+               Dx_simple) %>%
+      summarize(n = n(),
+                prop_cell_type = n / unique(n_cells))
+
+stat.test <- per_patient %>%
+  group_by(t_cell_type_subcluster) %>%
+  wilcox_test(prop_cell_type ~ Dx_simple) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>% 
+  add_xy_position(x = "t_cell_type_subcluster", dodge = 1)
+
+p <- ggplot(per_patient, aes(t_cell_type_subcluster, prop_cell_type)) +
+  geom_boxplot(aes(fill = Dx_simple),
+               size = 1,
+               alpha = 0.6,
+               coef = 1e5) +
+  geom_beeswarm(aes(color = Dx_simple),
+                dodge.width=1,
+                size = 0.75)  +
+  stat_pvalue_manual(stat.test,  
+                     label = "{p.adj}{p.adj.signif}", 
+                     tip.length = 0, 
+                     hide.ns = T) +
+  scale_fill_manual(values = palette_OkabeIto) + 
+  scale_color_manual(values = palette_OkabeIto) +
+  labs(x ="",
+       y = "Proportion of cells",
+       color = "",
+       fill = "") +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1,
+                                   vjust = 0.5))
+
+p
+save_plot(file.path(fig_dir, "t-cell-subpopulations-per-dx.pdf"),
+          p,
+          base_asp = 2)
+```
+
+Statistics for pairwise comparisions using wilcox rank sum test, corrected using bonferroni. Using a count based test (e.g. edgeR) may be more sensitive
+
+```{r, rows.print=50, cols.min.print=5}
+stat.test  %>% 
+  select(1, group1, group2, p:p.adj.signif, n1:statistic)
+```
+
+```{r}
+per_patient <- group_by(get_metadata(so), UPN) %>%
+      mutate(n_cells = n()) %>%
+      group_by(UPN,
+               t_cell_type_subcluster,
+               mutation_status) %>%
+      summarize(n = n(),
+                prop_cell_type = n / unique(n_cells))
+
+
+stat.test <- per_patient %>%
+  group_by(t_cell_type_subcluster) %>%
+  wilcox_test(prop_cell_type ~ mutation_status) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>% 
+  add_xy_position(x = "t_cell_type_subcluster", dodge = 1)
+
+p <- ggplot(per_patient, aes(t_cell_type_subcluster, prop_cell_type)) +
+  geom_boxplot(aes(fill = mutation_status),
+               size = 1,
+               alpha = 0.6,
+               coef = 1e5) +
+  geom_beeswarm(aes(color = mutation_status),
+                dodge.width=1,
+                size = 0.75)  +
+  stat_pvalue_manual(stat.test,  
+                     label = "{p.adj}{p.adj.signif}", 
+                     tip.length = 0, 
+                     hide.ns = T) +
+  scale_fill_manual(values = palette_OkabeIto) + 
+  scale_color_manual(values = palette_OkabeIto) +
+  labs(x ="",
+       y = "Proportion of cells",
+       color = "",
+       fill = "") +
+  theme(axis.text.x = element_text(angle = 90,
+                                   hjust = 1,
+                                   vjust = 0.5))
+
+p
+save_plot(file.path(fig_dir, "t-cell-subpopulations-per-mutation-type.pdf"),
+          p,
+          base_asp = 2)
+```
+
+Statistics for pairwise comparisions using wilcox rank sum test, corrected using bonferroni. Using a count based test (e.g. edgeR) may be more sensitive
+
+```{r, rows.print=50, cols.min.print=5}
+stat.test  %>% 
+  select(1, group1, group2, p:p.adj.signif, n1:statistic)
+```
+
+```{r}
+plot_cell_proportions(so, 
+                      sample_id = "UPN",
+                      group_id = "t_cell_type_subcluster",
+                      facet_by = "Dx_simple"
+                      ) +
+  labs(x = "UPN",
+       fill = "")
+```
+## Go Terms
+
+```{r}
+library(gprofiler2)
+library(ggrepel)
+# Use top 200 markers 
+mkrs <- read_tsv(file.path("markers", 
+                           "t_cell_type_subcluster_cluster_markers.tsv")) %>% 
+  filter(logFC > 0,
+         pct_in > 10,
+         padj < 0.05) %>% 
+  group_by(group) %>% 
+  dplyr::slice(1:200)
+mkrs_split <- split(mkrs, mkrs$group) %>% 
+  map(~pull(.x, feature))
+go_res <- gost(mkrs_split, 
+               ordered_query = TRUE,
+               sources = c("GO", 
+                          "KEGG", 
+                          "REAC", 
+                          "TF"))
+go_res[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ",")))) %>% 
+  write_tsv(., file.path(tbls_dir, "goterms_t_cell_type_subclusters.tsv"))
+go_res[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ","))),
+         source = str_replace_all(source, "[[:punct:]]", " ")) %>% 
+  select(-significant) %>% 
+  split(., .$query) %>% 
+  openxlsx::write.xlsx(., 
+                       file.path(tbls_dir, "goterms_t_cell_type_subclusters.xlsx"),
+                       overwrite = TRUE)
+```
+
+```{r}
+go_res_all <- gost(mkrs_split, 
+               ordered_query = TRUE, 
+               significant = FALSE,
+               sources = c("GO", 
+                          "KEGG", 
+                          "REAC", 
+                          "TF"))
+go_res_to_plot <- go_res_all[["result"]] %>% 
+  mutate(parents = unlist(map(parents, ~str_c(.x, collapse = ","))),
+         source = str_replace_all(source, "[[:punct:]]", " ")) %>% 
+  select(-significant) 
+```
+
+```{r, fig.height = 9, fig.width = 9}
+dbs <- c("GO BP", "GO MF", "GO CC")
+top_n_terms <- 10
+gterm_hmaps <- map(dbs,
+    ~{
+  res <- filter(go_res_to_plot, 
+                   source == .x,
+                   p_value < 0.05) %>% 
+    group_by(query) %>% 
+    arrange(p_value, .by_group = TRUE) %>% 
+    dplyr::slice(1:top_n_terms)
+  
+  to_plot <- filter(go_res_to_plot,
+                    source == .x,
+                    term_name %in% res$term_name) %>%
+    select(query, p_value, term_name) %>% 
+    pivot_wider(names_from = query, values_from = p_value) %>% 
+    column_to_rownames("term_name") %>% 
+    as.matrix() 
+  
+  to_plot[is.na(to_plot)] <- 1
+  to_plot <- -log10(to_plot)
+  hmap <- Heatmap(to_plot, 
+          name = "-log10(pvalue)",
+          column_title = .x,
+          column_order = unique(res$query),
+          row_order = unique(res$term_name),
+          col = viridis::magma(256),
+          cluster_columns = TRUE, 
+          cluster_rows = FALSE, 
+          row_names_side = "left",
+          row_names_gp = gpar(fontsize = 8))
+  hmap
+})
+walk(gterm_hmaps, draw)
+```
+ 
+## Overview umap figs
+
+```{r}
+reid <- c("CD8_TH1" = "CD8_TH1",
+          "gdT" = "gdT",
+          "NK_cells"= "NK",
+          "NKT" = "NKT",
+          "CD4" = "CD4",
+          "CD4_TCM"= "CD4",
+          "T(1)" = "CD8_dying",
+          "T(2)" = "CD8",
+          "Treg" = "Treg")
+  
+so$simple_t_cell_type <- reid[so$t_cell_type_subcluster]
+p <- plot_harmony(so, 
+                  "simple_t_cell_type", 
+                  .cols = palette_OkabeIto, 
+                  sorted = "random",
+                  legend_title = "")
+
+p
+
+save_plot(file.path(fig_dir, "umap_by_simplified_t_cell_type.pdf"),
+          p,
+          base_asp = 1.4)
+```
+
+
+## Clustrees
+
+```{r}
+library(clustree)
+p <- clustree(so, prefix = "t_harmony_res.") +
+  scale_color_manual(values = discrete_palette_default)
+p
+save_plot(file.path(fig_dir, "t_harmony_clustree_0.3_selected.pdf"), 
+          p,
+          base_asp = 1.5,
+          base_height = 8)
+```
+
+## Save data
+
+```{r, eval = TRUE}
+qsave(so, file.path("objects", "so_lym.qs"))
+#so <- qread( file.path("objects", "so_lym.qs"))
+```
+
+## Session info
+```{r}
+sessioninfo::session_info()
+```
+

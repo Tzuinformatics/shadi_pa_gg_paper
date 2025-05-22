@@ -1,0 +1,131 @@
+---
+title: "Analysis of Ganglioglioma populations"
+author: "Kent Riemondy RBI"
+date: "`r Sys.Date()`"
+knit: (function(inputFile, encoding) {
+  rmarkdown::render(inputFile, encoding = encoding, output_dir = "html") })
+output:
+  html_document:
+    theme: yeti
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    highlight: kate
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+
+```{r, message = FALSE}
+# source(here::here("src/utils.R"))
+source(here::here(file.path("..", "..", "..", "src/utils.R")))
+
+seed_value <- 20210805
+library(ggbeeswarm)
+library(ggpubr)
+library(rstatix)
+library(GeneOverlap)
+```
+
+```{r}
+tumor_types <- c("gg", "pa")
+sos <- map(tumor_types, 
+           ~qread(file.path("objects", 
+                            str_c("so_tumor_",
+                                  .x, 
+                                  ".qs")
+                           ),
+                  nthreads = 4)
+           )
+```
+
+## Overview 
+
+```{r}
+n_markers <- 200
+mkrs <- map(tumor_types, 
+                   ~{
+                     read_tsv(file.path("markers",
+                                       str_c(.x, 
+                                             "_harmony_cluster_markers.tsv")
+                                       ))  %>% 
+  filter(padj < 0.05) %>% 
+  group_by(group) %>% 
+  arrange(padj, desc(logFC), .by_group = TRUE) %>% 
+  slice(1:n_markers) %>% 
+  split(., .$group) %>% 
+  map(~pull(.x, feature))})
+
+mkrs <- map(tumor_types, 
+            ~{
+              data <- read_tsv(file.path("markers", str_c(.x, "_harmony_cluster_markers.tsv")))
+              print(str(data))  # Check data structure
+              data <- data %>%
+                filter(padj < 0.05) %>% 
+                mutate(group = as.character(group), feature = as.character(feature)) %>%  # Ensure standard types
+                group_by(group) %>% 
+                arrange(padj, desc(logFC), .by_group = TRUE) %>% 
+                slice(1:n_markers)
+              print(head(data))  # Check filtered/sorted data
+              data %>% split(., .$group) %>% map(~pull(.x, feature))
+            })
+
+
+
+
+
+
+
+
+mkrs <- map(mkrs, ~{names(.x) <- str_c("c", names(.x)); .x})
+
+gom <- newGOM(mkrs[[1]], 
+              mkrs[[2]],
+              genome.size = min(map_dbl(sos, nrow)))
+# extract overlaps
+pvals  <- getMatrix(gom, c("pval")) 
+pvals <- apply(pvals, 2, function(x) p.adjust(x, n = length(pvals)))
+jaccard <- getMatrix(gom, "Jaccard")
+odds <- getMatrix(gom, c("odds.ratio"))
+# clip really low pvals to avoid take log10 of 0)
+clip_val <- 1e-300
+  
+pvals[pvals < clip_val] <- clip_val
+pvals <- -log10(pvals)
+h <- Heatmap(jaccard,
+        name = "Jaccard index", 
+        col = viridis::viridis(256),
+       row_title = "GG subpopulations",
+        column_title = "PA subpopulations",
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          bin <- findInterval(pvals[i, j], c(-log10(0.01), 20, 200))
+          txt <- c("*", "**", "***")[bin]
+          grid.text(txt, x, y, gp = gpar(fontsize = 10, col = "white"))
+}, 
+                    cluster_rows = FALSE,
+                    cluster_columns = FALSE)
+lgd_list <-  list(
+    Legend(labels = c("*** < 1e-200",
+                      "** < 1e-20",
+                      "* < 1e-2"), 
+           title = "Adj. p.val")
+)
+draw(h, heatmap_legend_list = lgd_list)
+pdf(file.path(fig_dir, "Marker_overlap_gg_and_pa.pdf"),
+    width = 7,
+    height = 4)
+  draw(h, heatmap_legend_list = lgd_list)
+dev.off()
+```
+
+## Session info
+```{r}
+sessioninfo::session_info()
+```
